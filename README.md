@@ -28,7 +28,7 @@ The integration test creates an isolated local D1 database and proves enrollment
 
 ## Cloudflare resources
 
-Production setup is driven by the guarded CLI. It refuses to proceed unless local `main` is clean and current, CI is green, GitHub and Cloudflare authentication work, and `constrovet.com` is already an active Cloudflare zone.
+Production setup is driven by the guarded CLI. It first prepares Cloudflare without changing Namecheap, verifies propagation, and records explicit website, app, and email acceptance. Production then refuses to proceed unless local `main` is clean and current, CI is green, authentication works, and `constrovet.com` is active in Cloudflare.
 
 On Ubuntu, install the Android signing utility before `configure-github`:
 
@@ -41,13 +41,17 @@ sudo apt install -y openjdk-17-jdk-headless
 cd /home/taran/challanse-website
 git pull --ff-only
 
+./scripts/go-live.sh dns-onboard
+# Enter the two printed nameservers in Namecheap, then wait.
+./scripts/go-live.sh dns-status
+./scripts/go-live.sh dns-accept
 ./scripts/go-live.sh preflight
 ./scripts/go-live.sh provision
 ./scripts/go-live.sh configure-github
 ./scripts/go-live.sh deploy
 ```
 
-`provision` idempotently creates D1, private R2, receipt and dead-letter queues, Turnstile, the reviewer Access application, and the landing DNS record. It saves only non-secret resource IDs under `~/.config/challanse/`; credentials are held in memory or sent directly to GitHub environment secrets. It never changes nameservers, mail records, or existing Constrovet records.
+`dns-onboard` idempotently creates or reuses the Cloudflare zone and preserves the approved `app`, `www`, and legacy Google MX records as DNS-only. It aborts on conflicts and prints the exact nameservers for the owner to enter manually. `provision` then creates D1, private R2, receipt and dead-letter queues, Turnstile, the reviewer Access application, and the landing DNS record. The CLI saves only non-secret state under `~/.config/challanse/`; credentials are held in memory or sent directly to GitHub environment secrets. It never changes Namecheap nameservers itself.
 
 Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `production` environment with required reviewer approval and the remaining values:
 
@@ -67,7 +71,7 @@ Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `produ
 | Secret | `CHALLANSE_KEY_ALIAS` |
 | Secret | `CHALLANSE_KEY_PASSWORD` |
 
-The Cloudflare token needs Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, Access Organization Read, and Zone DNS permissions scoped to the Constrovet account/zone. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for the authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
+The Cloudflare token needs Zone Read, Zone DNS Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
 
 ## Seed a real site
 

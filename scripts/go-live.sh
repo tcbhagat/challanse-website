@@ -7,6 +7,7 @@ WORKFLOW="ci-pages.yml"
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/challanse"
 STATE_FILE="$STATE_DIR/production.env"
 DNS_BASELINE="$STATE_DIR/dns-baseline.json"
+DNS_ONBOARDING_BASELINE="$STATE_DIR/dns-onboarding.json"
 CF_API="https://api.cloudflare.com/client/v4"
 
 mkdir -p "$STATE_DIR"
@@ -68,6 +69,120 @@ assert_zone() {
   [[ -n "$ZONE_ID" && "$status" == "active" ]] || die "constrovet.com is not an active Cloudflare zone. Complete docs/dns-cutover.md first."
   save_state ZONE_ID "$ZONE_ID"
 }
+
+find_zone() {
+  local zones
+  zones="$(cf GET '/zones?name=constrovet.com')"
+  ZONE_ID="$(jq -r '.result[0].id // empty' <<<"$zones")"
+  if [[ -n "$ZONE_ID" ]]; then
+    local account_id
+    account_id="$(jq -r '.result[0].account.id // empty' <<<"$zones")"
+    [[ "$account_id" == "$CLOUDFLARE_ACCOUNT_ID" ]] || die "constrovet.com exists in a different Cloudflare account. Do not continue."
+  fi
+}
+
+ensure_preserved_dns_record() {
+  local type="$1" name="$2" content="$3" priority="${4:-}" records count existing expected body
+  records="$(cf GET "/zones/$ZONE_ID/dns_records?name=$name&type=$type")"
+  count="$(jq '.result | length' <<<"$records")"
+  expected="$type|$content|false|$priority"
+  if [[ "$count" == "0" ]]; then
+    if [[ "$type" == "MX" ]]; then
+      body="$(jq -nc --arg type "$type" --arg name "$name" --arg content "$content" --argjson priority "$priority" '{type:$type,name:$name,content:$content,priority:$priority,ttl:1,proxied:false}')"
+    else
+      body="$(jq -nc --arg type "$type" --arg name "$name" --arg content "$content" '{type:$type,name:$name,content:$content,ttl:1,proxied:false}')"
+    fi
+    cf POST "/zones/$ZONE_ID/dns_records" "$body" >/dev/null
+    printf 'Created preserved record: %s %s -> %s\n' "$type" "$name" "$content"
+    return
+  fi
+  [[ "$count" == "1" ]] || die "Multiple Cloudflare records exist for $name. Review them manually; nothing was changed."
+  existing="$(jq -r '.result[0] | [.type,.content,(.proxied // false | tostring),(.priority // "" | tostring)] | join("|")' <<<"$records")"
+  [[ "$existing" == "$expected" ]] || die "Conflicting Cloudflare record for $name: $existing. Expected: $expected. Nothing was changed."
+  printf 'Preserved record already correct: %s %s -> %s\n' "$type" "$name" "$content"
+}
+
+dns_onboard() {
+  for command in jq curl git; do need "$command"; done
+  [[ -z "$(git status --porcelain)" ]] || die "Git working tree is not clean."
+  cloudflare_login
+  find_zone
+  if [[ -z "$ZONE_ID" ]]; then
+    confirm "Create the constrovet.com Cloudflare zone on the Free plan. This does not change Namecheap nameservers."
+    local body created
+    body="$(jq -nc --arg name constrovet.com --arg account "$CLOUDFLARE_ACCOUNT_ID" '{name:$name,account:{id:$account},type:"full"}')"
+    created="$(cf POST '/zones' "$body")"
+    ZONE_ID="$(jq -r '.result.id // empty' <<<"$created")"
+    [[ -n "$ZONE_ID" ]] || die "Cloudflare did not return a zone ID."
+  fi
+  save_state ZONE_ID "$ZONE_ID"
+  ensure_preserved_dns_record A app.constrovet.com 34.102.192.38
+  ensure_preserved_dns_record CNAME www.constrovet.com tcbhagat.github.io
+  ensure_preserved_dns_record MX constrovet.com alt4.aspmx.l.google.com 10
+
+  local zone nameserver_one nameserver_two
+  zone="$(cf GET "/zones/$ZONE_ID")"
+  nameserver_one="$(jq -r '.result.name_servers[0] // empty' <<<"$zone")"
+  nameserver_two="$(jq -r '.result.name_servers[1] // empty' <<<"$zone")"
+  [[ -n "$nameserver_one" && -n "$nameserver_two" ]] || die "Cloudflare has not assigned two nameservers."
+  save_state CLOUDFLARE_NAMESERVER_1 "$nameserver_one"
+  save_state CLOUDFLARE_NAMESERVER_2 "$nameserver_two"
+  cf GET "/zones/$ZONE_ID/dns_records?per_page=500" | jq '[.result[] | select(.name == "app.constrovet.com" or .name == "www.constrovet.com" or (.type == "MX" and .name == "constrovet.com")) | {type,name,content,priority,proxied}] | sort_by(.type,.name)' > "$DNS_ONBOARDING_BASELINE"
+  chmod 600 "$DNS_ONBOARDING_BASELINE"
+  cat <<EOF
+
+Cloudflare DNS is ready. No Namecheap setting has been changed.
+
+In Namecheap:
+1. Domain List -> Manage beside constrovet.com.
+2. Open Domain (not Advanced DNS).
+3. Nameservers -> Custom DNS.
+4. Enter exactly:
+   $nameserver_one
+   $nameserver_two
+5. Click the green checkmark. Keep DNSSEC off and do not delete Advanced DNS records.
+
+Then wait 15-30 minutes and run:
+  ./scripts/go-live.sh dns-status
+EOF
+}
+
+dns_status() {
+  for command in jq curl dig; do need "$command"; done
+  load_state
+  [[ -n "${CLOUDFLARE_NAMESERVER_1:-}" && -n "${CLOUDFLARE_NAMESERVER_2:-}" ]] || die "Run dns-onboard first."
+  local ns app_record www_record mx_record www_status app_status
+  ns="$(dig @1.1.1.1 NS constrovet.com +short | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort)"
+  if ! grep -Fxq "${CLOUDFLARE_NAMESERVER_1,,}" <<<"$ns" || ! grep -Fxq "${CLOUDFLARE_NAMESERVER_2,,}" <<<"$ns"; then
+    printf 'Cloudflare is still waiting for the nameserver change. Current public nameservers:\n%s\n' "$ns" >&2
+    die "Wait 15-30 minutes and rerun dns-status. Cloudflare activation can take up to 24 hours."
+  fi
+  app_record="$(dig @1.1.1.1 A app.constrovet.com +short | sort)"
+  www_record="$(dig @1.1.1.1 CNAME www.constrovet.com +short | tr '[:upper:]' '[:lower:]')"
+  mx_record="$(dig @1.1.1.1 MX constrovet.com +short | tr '[:upper:]' '[:lower:]')"
+  [[ "$app_record" == "34.102.192.38" ]] || die "app.constrovet.com changed: $app_record"
+  [[ "$www_record" == "tcbhagat.github.io." ]] || die "www.constrovet.com changed: $www_record"
+  [[ "$mx_record" == "10 alt4.aspmx.l.google.com." ]] || die "Constrovet MX changed: $mx_record"
+  www_status="$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' https://www.constrovet.com/)" || die "www.constrovet.com failed HTTPS validation."
+  app_status="$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' https://app.constrovet.com/)" || die "app.constrovet.com failed HTTPS validation."
+  [[ "$www_status" != "000" && "$app_status" != "000" ]] || die "A production service could not be reached over HTTPS."
+  printf 'DNS and HTTPS checks passed. www HTTP %s; app HTTP %s.\n' "$www_status" "$app_status"
+  printf 'Now test email in both directions, then run: ./scripts/go-live.sh dns-accept\n'
+}
+
+dns_accept() {
+  dns_status
+  local answer
+  read -r -p 'Open www.constrovet.com with no certificate warning. Type WEBSITE OK: ' answer
+  [[ "$answer" == "WEBSITE OK" ]] || die "Website acceptance was not confirmed."
+  read -r -p 'Open app.constrovet.com and confirm its normal service appears. Type APP OK: ' answer
+  [[ "$answer" == "APP OK" ]] || die "App acceptance was not confirmed."
+  read -r -p 'Send and receive @constrovet.com email successfully. Type EMAIL BOTH DIRECTIONS OK: ' answer
+  [[ "$answer" == "EMAIL BOTH DIRECTIONS OK" ]] || die "Email acceptance was not confirmed."
+  save_state DNS_ACCEPTED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  save_state DNS_ACCEPTED_ZONE_ID "$ZONE_ID"
+  printf 'Cloudflare migration accepted. ChallanSe preflight may now continue.\n'
+}
 assert_clean_main() {
   [[ -z "$(git status --porcelain)" ]] || die "Git working tree is not clean."
   [[ "$(git branch --show-current)" == "main" ]] || die "Checkout main before production operations."
@@ -98,6 +213,8 @@ preflight() {
   cloudflare_login
   wrangler whoami >/dev/null
   assert_zone
+  load_state
+  [[ -n "${DNS_ACCEPTED_AT:-}" && "${DNS_ACCEPTED_ZONE_ID:-}" == "$ZONE_ID" ]] || die "Run dns-status and dns-accept after website, app, and email checks pass."
   printf 'Preflight passed for %s. Production deployment remains disabled.\n' "$REPO"
 }
 
@@ -352,6 +469,9 @@ download_apk() {
 usage() {
   cat <<'USAGE'
 Usage: scripts/go-live.sh <command>
+  dns-onboard
+  dns-status
+  dns-accept
   preflight
   provision
   configure-github
@@ -363,6 +483,9 @@ USAGE
 }
 
 case "${1:-}" in
+  dns-onboard) dns_onboard ;;
+  dns-status) dns_status ;;
+  dns-accept) dns_accept ;;
   preflight) preflight ;;
   provision) provision ;;
   configure-github) configure_github ;;

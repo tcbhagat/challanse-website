@@ -1,32 +1,88 @@
-# DNS and production cutover
+# Beginner-safe Cloudflare activation
 
-Do not change nameservers until this checklist is signed off by the domain owner.
+This migration changes only the authoritative DNS provider. It must preserve the existing website, application, and Google Workspace email.
 
-## Inventory
+## Before starting
 
-1. Export every Namecheap record and capture screenshots of the current DNS and email configuration.
-2. Recreate all `A`, `AAAA`, `CNAME`, `MX`, `TXT`, SPF, DKIM, DMARC, CAA, and ownership-verification records in Cloudflare without changing values or TTL intent.
-3. Keep email-related records DNS-only. Do not proxy mail hosts.
-4. Verify `www.constrovet.com`, apex redirects, and inbound/outbound email before nameserver cutover.
+Confirm all three services work and write down what you observed:
 
-## ChallanSe records
+1. Open `https://www.constrovet.com`.
+2. Open `https://app.constrovet.com`.
+3. Send an external email to an active `@constrovet.com` mailbox.
+4. Reply from that mailbox and confirm delivery.
 
-1. Configure GitHub Pages custom domain `challanse.constrovet.com` and verify its domain challenge.
-2. Deploy the API and reviewer Workers with their custom domains.
-3. Protect the reviewer host and reviewer/admin API paths with Cloudflare Access.
-4. Confirm valid HTTPS and no redirect loops on all three hosts.
-5. Verify exact-origin CORS rejects every origin except the public and reviewer hosts.
+Keep the supplied Namecheap screenshot. Do not continue if any service is already failing.
 
-## Controlled cutover
+## Prepare Cloudflare safely
 
-1. Set the GitHub production variables and secrets while `PILOT_DEPLOY_ENABLED=false`.
-2. Run staging validation and obtain owner approval.
-3. Change authoritative nameservers at Namecheap to the assigned Cloudflare nameservers.
-4. Monitor DNS and email resolution from two independent networks.
-5. Enable production deployment and approve the protected GitHub environment.
-6. Update the main Constrovet navbar only after all three production readiness checks pass.
-7. Replace the old ChallanSe page with a canonical client-side redirect only after the new URL is stable.
+Run:
 
-## Rollback
+```bash
+cd /home/taran/challanse-website
+git pull --ff-only
+./scripts/go-live.sh dns-onboard
+```
 
-Disable `PILOT_DEPLOY_ENABLED`, restore the exported DNS records/nameservers, and leave the existing Constrovet route unchanged. Device records remain in the local queue until the approved API is restored.
+The command prompts for a Cloudflare API token and account ID, creates or reuses the `constrovet.com` Free-plan zone, and checks these records exactly:
+
+| Type | Host | Value | Priority | Status |
+| --- | --- | --- | --- | --- |
+| A | `app` | `34.102.192.38` | — | DNS only |
+| CNAME | `www` | `tcbhagat.github.io` | — | DNS only |
+| MX | `@` | `ALT4.ASPMX.L.GOOGLE.COM` | `10` | DNS only |
+
+It aborts instead of overwriting a conflicting record. It does not create ChallanSe records, change Namecheap, or store the Cloudflare token.
+
+The token needs Zone Read and DNS Edit for `constrovet.com`, plus Zone Edit if the zone has not yet been added. Select only the Constrovet account and domain when creating it.
+
+## Change Namecheap nameservers
+
+The CLI prints two Cloudflare nameservers. Copy them exactly.
+
+1. Sign in to Namecheap and open **Domain List**.
+2. Click **Manage** beside `constrovet.com`.
+3. Open the **Domain** tab, not **Advanced DNS**.
+4. Find **Nameservers**.
+5. Change **Namecheap BasicDNS** to **Custom DNS**.
+6. Paste the first Cloudflare nameserver.
+7. Add the second row and paste the second nameserver.
+8. Click the green checkmark.
+9. Leave DNSSEC off.
+10. Do not delete the old Namecheap Advanced DNS records; they are the rollback reference.
+
+## Wait and verify
+
+Every 15–30 minutes run:
+
+```bash
+./scripts/go-live.sh dns-status
+```
+
+This checks Cloudflare nameservers, the exact `app`, `www`, and MX values, and HTTPS for both public services. Activation can take up to 24 hours.
+
+After the command passes, manually test inbound and outbound email again. Then record acceptance:
+
+```bash
+./scripts/go-live.sh dns-accept
+```
+
+The command requires explicit confirmation for the website, application, and both email directions. No email contents or credentials are stored.
+
+## If anything fails
+
+Immediately return to Namecheap **Domain List → Manage → Domain → Nameservers**, select **Namecheap BasicDNS**, and click the green checkmark. Do not delete Cloudflare or Namecheap records while diagnosing.
+
+## Continue ChallanSe
+
+Only after `dns-accept` succeeds:
+
+```bash
+./scripts/go-live.sh preflight
+./scripts/go-live.sh provision
+./scripts/go-live.sh configure-github
+./scripts/go-live.sh deploy
+```
+
+The production preflight refuses to continue without the local DNS acceptance marker and an active Cloudflare zone.
+
+References: [Cloudflare full-zone setup](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/), [Namecheap nameserver instructions](https://www.namecheap.com/support/knowledgebase/article.aspx/767/10/how-to-change-dns-for-a-domain/), and [Google Workspace MX guidance](https://support.google.com/a/answer/9222085).
