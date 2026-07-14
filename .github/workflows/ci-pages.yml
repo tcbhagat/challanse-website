@@ -28,6 +28,7 @@ jobs:
       - run: npm audit --omit=dev --audit-level=high
       - run: npm run build
       - run: bash scripts/test-edge-integration.sh
+      - run: bash scripts/test-production-config.sh
       - name: Run landing Lighthouse gate
         run: |
           python3 -m http.server 4173 --directory dist/landing > /tmp/challanse-http.log 2>&1 &
@@ -125,7 +126,8 @@ jobs:
       - name: Build reviewer
         run: npm run build --workspace @challanse/reviewer
         env:
-          VITE_API_BASE_URL: https://api.challanse.constrovet.com
+          VITE_API_BASE_URL: /api
+          VITE_PUBLIC_API_URL: https://api.challanse.constrovet.com
       - name: Deploy reviewer
         run: npx wrangler deploy --config apps/reviewer/wrangler.toml
         env:

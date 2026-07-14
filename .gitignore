@@ -5,6 +5,7 @@ node_modules/
 dist/
 .wrangler/
 apps/*/dist/
+apps/*/worker-dist/
 apps/mobile/android/.gradle/
 apps/mobile/android/app/build/
 apps/mobile/android/build/

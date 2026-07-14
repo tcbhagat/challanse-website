@@ -3,6 +3,7 @@ import QRCode from 'qrcode';
 import type { ReceiptListItem, ReceiptReview, ReceiptStatus } from '@challanse/contracts';
 import {
   API_BASE_URL,
+  PUBLIC_API_URL,
   ApiError,
   createEnrollmentCode,
   getAdminSummary,
@@ -92,7 +93,7 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
     setMessage('');
     try {
       const result = await createEnrollmentCode(deviceName);
-      const payload = `challanse://enroll?api=${encodeURIComponent(API_BASE_URL)}&code=${encodeURIComponent(result.enrollmentCode)}`;
+      const payload = `challanse://enroll?api=${encodeURIComponent(PUBLIC_API_URL)}&code=${encodeURIComponent(result.enrollmentCode)}`;
       setEnrollment({ code: result.enrollmentCode, qr: await QRCode.toDataURL(payload, { width: 260, margin: 1, errorCorrectionLevel: 'M' }) });
     } catch (caught) { setMessage(caught instanceof Error ? caught.message : 'Unable to create enrollment code.'); }
   };

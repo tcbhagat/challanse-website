@@ -1,7 +1,9 @@
 import type { ReceiptListItem, ReceiptReview } from '@challanse/contracts';
 
 const configuredBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
-export const API_BASE_URL = (configuredBase || 'http://127.0.0.1:8787').replace(/\/$/, '');
+const configuredPublicApi = import.meta.env.VITE_PUBLIC_API_URL as string | undefined;
+export const API_BASE_URL = (configuredBase || '/api').replace(/\/$/, '');
+export const PUBLIC_API_URL = (configuredPublicApi || 'https://api.challanse.constrovet.com').replace(/\/$/, '');
 
 export class ApiError extends Error {
   constructor(public status: number, message: string, public code = 'REQUEST_FAILED') {

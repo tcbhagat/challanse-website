@@ -10,11 +10,13 @@
 
 ## Readiness
 
+0. Run `./scripts/go-live.sh preflight`, `provision`, `configure-github`, and `deploy` in order; never bypass a failed guard.
 1. Confirm production `/health` and `/ready` responses.
 2. Confirm Cloudflare Access denies an unapproved email and permits both reviewers.
 3. Seed only owner-approved vendors and Wi-Fi SSIDs.
 4. Enroll two devices using separate single-use QR codes; prove expiry, reuse rejection, and revocation.
 5. Confirm each device shows the correct site and vendor choices while offline.
+6. Run `./scripts/go-live.sh verify` after the first real receipt reaches the reviewer inbox.
 
 ## Field acceptance
 
@@ -37,6 +39,8 @@
 ## Incident response
 
 Revoke a lost device immediately, preserve its unsynced local data if recoverable, and rotate the device-token pepper only as a coordinated re-enrollment event. Disable pilot deployment or uploads when authorization, data isolation, checksum validation, or retention controls fail.
+
+`./scripts/rollback-production.sh` disables deployment without deleting cloud or device data. Add `--revoke-devices` only when all enrolled credentials must be invalidated.
 
 ## Pilot limits
 

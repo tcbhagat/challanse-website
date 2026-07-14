@@ -28,16 +28,19 @@ The integration test creates an isolated local D1 database and proves enrollment
 
 ## Cloudflare resources
 
-Create these resources before enabling deployment:
+Production setup is driven by the guarded CLI. It refuses to proceed unless local `main` is clean and current, CI is green, GitHub and Cloudflare authentication work, and `constrovet.com` is already an active Cloudflare zone.
 
 ```bash
-npx wrangler d1 create challanse-pilot
-npx wrangler r2 bucket create challanse-receipts
-npx wrangler queues create challanse-receipts
-npx wrangler queues create challanse-receipts-dlq
+cd /home/taran/challanse-website
+git pull --ff-only
+
+./scripts/go-live.sh preflight
+./scripts/go-live.sh provision
+./scripts/go-live.sh configure-github
+./scripts/go-live.sh deploy
 ```
 
-Create a Turnstile widget for `challanse.constrovet.com` and a Cloudflare Access self-hosted application covering `review.challanse.constrovet.com/*` and reviewer/admin API paths. Allow only the two approved reviewer email addresses.
+`provision` idempotently creates D1, private R2, receipt and dead-letter queues, Turnstile, the reviewer Access application, and the landing DNS record. It saves only non-secret resource IDs under `~/.config/challanse/`; credentials are held in memory or sent directly to GitHub environment secrets. It never changes nameservers, mail records, or existing Constrovet records.
 
 Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `production` environment with required reviewer approval and the remaining values:
 
@@ -57,24 +60,28 @@ Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `produ
 | Secret | `CHALLANSE_KEY_ALIAS` |
 | Secret | `CHALLANSE_KEY_PASSWORD` |
 
-The Cloudflare token needs only Workers Scripts, D1, R2, Queues, and Zone DNS permissions for the ChallanSe zone. Generate the device pepper with a cryptographically secure 32-byte random value. Never commit either value.
+The Cloudflare token needs Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, Access Organization Read, and Zone DNS permissions scoped to the Constrovet account/zone. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for the authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
 
 ## Seed a real site
 
-Prepare reviewed values without embedding them in source control:
+Prepare a private vendor file containing one to four real vendors:
 
-```bash
-SITE_ID=site-pilot-01 \
-SITE_NAME='Approved site name' \
-REVIEWER_EMAIL='controller@example.com' \
-WIFI_SSIDS_JSON='["Approved site Wi-Fi"]' \
-VENDORS_JSON='[{"id":"vendor-01","name":"Approved vendor","initials":"AV","color":"#006D77"}]' \
-node scripts/bootstrap-pilot.mjs > /tmp/challanse-pilot.sql
-
-npx wrangler d1 execute challanse-pilot --remote --file /tmp/challanse-pilot.sql
+```json
+[
+  {"id":"vendor-approved-id","name":"Approved vendor name","initials":"AV","color":"#006D77"}
+]
 ```
 
-An administrator then creates a 10-minute enrollment QR in the reviewer app. The Android device exchanges it once, stores its revocable credential in Android Keystore, and downloads the real site/vendor configuration.
+Seed, download, install, enroll, and capture one real receipt before final verification:
+
+```bash
+./scripts/go-live.sh seed --vendors-file /secure/challanse-vendors.json
+./scripts/go-live.sh download-apk
+# Install the downloaded APK, enroll through the reviewer, capture and sync one real receipt.
+./scripts/go-live.sh verify
+```
+
+The first reviewer entered during provisioning is the administrator; the second is a controller. The administrator creates separate 10-minute enrollment QR codes in the reviewer app. The Android device exchanges its code once, stores its revocable credential in Android Keystore, and downloads the real site/vendor configuration.
 
 ## Deployment safety
 
@@ -83,3 +90,10 @@ Production deployment is intentionally disabled unless `PILOT_DEPLOY_ENABLED=tru
 The capped pilot is designed around the free allowances, not an uptime guarantee: [D1 free-plan recovery is limited](https://developers.cloudflare.com/d1/platform/limits/), [R2 includes 10 GB-month of standard storage](https://developers.cloudflare.com/r2/pricing/), and [Queues includes 10,000 operations per day](https://developers.cloudflare.com/queues/platform/pricing/). Recheck these limits before enabling production because provider allowances can change.
 
 Follow `docs/dns-cutover.md` before changing nameservers and `docs/pilot-runbook.md` for field rollout and rollback. Zero-budget operation provides no uptime SLA and no independent off-provider backup.
+
+Emergency stop, preserving every receipt and image:
+
+```bash
+./scripts/rollback-production.sh
+./scripts/rollback-production.sh --revoke-devices
+```

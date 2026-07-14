@@ -67,14 +67,18 @@ export async function consumeReplayNonce(request: Request, env: Env, deviceId: s
   return Number(result.meta.changes ?? 0) === 1;
 }
 
-export async function authenticateReviewer(request: Request, env: Env): Promise<ReviewerIdentity | null> {
+export async function authenticateReviewer(
+  request: Request,
+  env: Env,
+  verifyToken: typeof jwtVerify = jwtVerify,
+): Promise<ReviewerIdentity | null> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion') ?? '';
   const domain = env.ACCESS_TEAM_DOMAIN.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!token || !domain || !env.ACCESS_AUD) return null;
   try {
     const issuer = `https://${domain}`;
     const jwks = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
-    const verified = await jwtVerify(token, jwks, { issuer, audience: env.ACCESS_AUD });
+    const verified = await verifyToken(token, jwks, { issuer, audience: env.ACCESS_AUD });
     const email = String(verified.payload.email ?? '').trim().toLowerCase();
     if (!email) return null;
     const row = await env.DB.prepare(
