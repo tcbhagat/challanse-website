@@ -1,0 +1,15 @@
+{
+  "name": "challanse-website",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "check": "npm run check:html && npm run check:js",
+    "check:html": "html-validate index.html",
+    "check:js": "node --check assets/js/main.js && node --check assets/js/challanse.js",
+    "audit": "lighthouse http://127.0.0.1:4173/ --only-categories=performance,accessibility,best-practices,seo --output=json --output-path=.lighthouse.json --quiet --chrome-flags=\"--headless=new --no-sandbox --disable-gpu\" && node scripts/check-lighthouse.mjs .lighthouse.json"
+  },
+  "devDependencies": {
+    "html-validate": "11.5.6",
+    "lighthouse": "13.4.0"
+  }
+}

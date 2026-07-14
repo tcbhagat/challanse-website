@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://tcbhagat.github.io/challanse-website/sitemap.xml
