@@ -68,6 +68,7 @@ button { background: none; border: 0; cursor: pointer; font: inherit; }
 .cv-nav__links a.active { color: var(--brand-700); font-weight: 600; }
 .cv-nav__links .cv-nav__cta,
 .cv-nav__drawer .cv-nav__cta { background: var(--accent-500); color: #281700; font-weight: 700; }
+.cv-nav button.cv-nav__cta { border: 0; border-radius: var(--radius-sm); cursor: pointer; font-size: .875rem; min-height: 36px; padding: 6px 10px; }
 .cv-nav__links .cv-nav__cta:hover,
 .cv-nav__drawer .cv-nav__cta:hover { background: var(--accent-600); color: var(--white); }
 .cv-nav__hamburger { display: none; flex-direction: column; gap: 5px; margin-left: auto; padding: 10px; }

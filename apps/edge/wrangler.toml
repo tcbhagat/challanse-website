@@ -1,0 +1,34 @@
+name = "challanse-api"
+main = "src/index.ts"
+compatibility_date = "2026-07-14"
+routes = [{ pattern = "api.challanse.constrovet.com", custom_domain = true }]
+
+[vars]
+ALLOWED_ORIGINS = "https://challanse.constrovet.com,https://review.challanse.constrovet.com"
+ACCESS_TEAM_DOMAIN = ""
+ACCESS_AUD = ""
+ENVIRONMENT = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "challanse-pilot"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "RECEIPTS"
+bucket_name = "challanse-receipts"
+
+[[queues.producers]]
+binding = "RECEIPT_QUEUE"
+queue = "challanse-receipts"
+
+[[queues.consumers]]
+queue = "challanse-receipts"
+max_batch_size = 20
+max_batch_timeout = 10
+max_retries = 5
+dead_letter_queue = "challanse-receipts-dlq"
+
+[triggers]
+crons = ["*/30 * * * *", "15 2 * * *"]

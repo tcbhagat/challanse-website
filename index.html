@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ChallanSe | Simple Site Receipt Capture | Constrovet</title>
   <meta name="description" content="ChallanSe helps site supervisors capture challans without forms and gives project teams a clear path from field receipt to review.">
-  <link rel="canonical" href="https://tcbhagat.github.io/challanse-website/">
+  <link rel="canonical" href="https://challanse.constrovet.com/">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Constrovet">
   <meta property="og:title" content="ChallanSe | Simple Site Receipt Capture">
   <meta property="og:description" content="A simpler way to capture site challans and identify receipts that need review.">
-  <meta property="og:url" content="https://tcbhagat.github.io/challanse-website/">
+  <meta property="og:url" content="https://challanse.constrovet.com/">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="ChallanSe | Simple Site Receipt Capture">
   <meta name="twitter:description" content="A simpler way to capture site challans and identify receipts that need review.">
@@ -40,8 +40,8 @@
       },
       {
         "@type": "WebPage",
-        "@id": "https://tcbhagat.github.io/challanse-website/#webpage",
-        "url": "https://tcbhagat.github.io/challanse-website/",
+        "@id": "https://challanse.constrovet.com/#webpage",
+        "url": "https://challanse.constrovet.com/",
         "name": "ChallanSe",
         "description": "Simple site receipt capture for construction supervisors and project teams.",
         "isPartOf": {"@id": "https://www.constrovet.com/#website"},
@@ -49,10 +49,10 @@
       },
       {
         "@type": "BreadcrumbList",
-        "@id": "https://tcbhagat.github.io/challanse-website/#breadcrumb",
+        "@id": "https://challanse.constrovet.com/#breadcrumb",
         "itemListElement": [
           {"@type": "ListItem", "position": 1, "name": "Home", "item": "https://www.constrovet.com/"},
-          {"@type": "ListItem", "position": 2, "name": "ChallanSe", "item": "https://tcbhagat.github.io/challanse-website/"}
+          {"@type": "ListItem", "position": 2, "name": "ChallanSe", "item": "https://challanse.constrovet.com/"}
         ]
       }
     ]
@@ -69,7 +69,7 @@
           <p class="cs-eyebrow">Challan capture for active sites</p>
           <h1 id="cs-title">Capture receipts.<br>Keep the gate moving.</h1>
           <p class="cs-lead">Supervisors photograph a challan, choose the vendor, and move on. Project teams get a clear path from field receipt to review.</p>
-          <a class="cs-button" href="https://www.constrovet.com/pages/contact.html?interest=challanse">Request Pilot</a>
+          <button class="cs-button" type="button" data-pilot-request>Request Pilot</button>
           <p class="cs-quiet">No forms or typing during capture.</p>
         </div>
 
@@ -197,7 +197,7 @@
           <p class="cs-eyebrow">Start with one site</p>
           <h2 id="cs-cta-title">See ChallanSe in your workflow.</h2>
         </div>
-        <a class="cs-button" href="https://www.constrovet.com/pages/contact.html?interest=challanse">Request Pilot</a>
+        <button class="cs-button" type="button" data-pilot-request>Request Pilot</button>
       </div>
     </section>
   </main>
@@ -205,10 +205,29 @@
   <footer class="cs-footer">
     <div class="cs-shell cs-footer__inner">
       <span>© <span id="cs-year"></span> Constrovet</span>
-      <nav aria-label="Footer"><a href="https://www.constrovet.com/pages/privacy.html">Privacy</a><a href="https://www.constrovet.com/pages/contact.html?interest=challanse">Contact</a></nav>
+      <nav aria-label="Footer"><a href="https://www.constrovet.com/pages/privacy.html">Privacy</a><button type="button" data-pilot-request>Contact</button></nav>
     </div>
   </footer>
 
+  <dialog class="cs-pilot-dialog" id="cs-pilot-dialog" aria-labelledby="cs-pilot-title">
+    <form class="cs-pilot-form" id="cs-pilot-form">
+      <div class="cs-pilot-form__header"><div><h2 id="cs-pilot-title">Request a one-site pilot</h2><p>Share business contact details only. Do not upload project documents.</p></div><button type="button" class="cs-dialog-close" aria-label="Close pilot request">×</button></div>
+      <div class="cs-pilot-form__grid">
+        <label>Name<input name="name" type="text" autocomplete="name" required maxlength="100"></label>
+        <label>Company<input name="company" type="text" autocomplete="organization" required maxlength="160"></label>
+        <label>Work email<input name="email" type="email" autocomplete="email" required maxlength="254"></label>
+        <label>Phone <span>optional</span><input name="phone" type="tel" autocomplete="tel" maxlength="24"></label>
+        <label class="cs-pilot-form__wide">What should the pilot prove? <span>optional</span><textarea name="message" maxlength="1000" rows="3"></textarea></label>
+      </div>
+      <input class="cs-honeypot" name="website" type="text" tabindex="-1" autocomplete="off" aria-hidden="true">
+      <div id="cs-turnstile"></div>
+      <p class="cs-form-status" id="cs-form-status" role="status"></p>
+      <button class="cs-button" type="submit">Send request</button>
+    </form>
+  </dialog>
+
+  <script src="assets/js/runtime-config.js?v=20260714"></script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
   <script src="assets/js/main.js?v=20260714"></script>
   <script src="assets/js/challanse.js?v=20260714"></script>
 </body>

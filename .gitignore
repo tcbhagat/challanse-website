@@ -1,3 +1,14 @@
 node_modules/
 .lighthouse.json
 .DS_Store
+dist/
+.wrangler/
+apps/*/dist/
+apps/mobile/android/.gradle/
+apps/mobile/android/app/build/
+apps/mobile/android/build/
+apps/mobile/android/*.jks
+apps/mobile/android/*.keystore
+apps/mobile/package-lock.json
+apps/edge/wrangler.generated.toml
+*.log

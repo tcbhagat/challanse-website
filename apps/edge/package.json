@@ -1,0 +1,24 @@
+{
+  "name": "@challanse/edge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@challanse/contracts": "1.0.0",
+    "jose": "6.1.0",
+    "zod": "4.1.12"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260714.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.110.0"
+  }
+}
