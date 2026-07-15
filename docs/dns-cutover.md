@@ -1,13 +1,13 @@
 # Beginner-safe Cloudflare activation
 
-This migration changes only the authoritative DNS provider. It must preserve the existing website, application, and Google Workspace email.
+This migration changes the authoritative DNS provider, preserves the existing website and Google Workspace email, and replaces the retired Google Cloud app origin with an approved HTTPS redirect to the active static app.
 
 ## Before starting
 
 Confirm all three services work and write down what you observed:
 
 1. Open `https://www.constrovet.com`.
-2. Open `https://app.constrovet.com`.
+2. Open the active app at `https://www.constrovet.com/app/`.
 3. Send an external email to an active `@constrovet.com` mailbox.
 4. Reply from that mailbox and confirm delivery.
 
@@ -27,13 +27,13 @@ The command prompts for a Cloudflare API token and account ID, creates or reuses
 
 | Type | Host | Value | Priority | Status |
 | --- | --- | --- | --- | --- |
-| A | `app` | `34.102.192.38` | — | DNS only |
+| A | `app` | `34.102.192.38` | — | Proxied for redirect only |
 | CNAME | `www` | `tcbhagat.github.io` | — | DNS only |
 | MX | `@` | `ALT4.ASPMX.L.GOOGLE.COM` | `10` | DNS only |
 
-It aborts instead of overwriting a conflicting record. It does not create ChallanSe records, change Namecheap, or store the Cloudflare token.
+The legacy app IP is retained only as a proxied placeholder. A Cloudflare zone rule returns `301` from `https://app.constrovet.com` to `https://www.constrovet.com/app/` before the retired origin is contacted. The command aborts instead of overwriting conflicting DNS or redirect rules. It does not create ChallanSe records, change Namecheap, or store the Cloudflare token.
 
-The token needs Zone Read and DNS Edit for `constrovet.com`, plus Zone Edit if the zone has not yet been added. Select only the Constrovet account and domain when creating it.
+The token needs Zone Read, DNS Edit, and Zone Rulesets Edit for `constrovet.com`, plus Zone Edit if the zone has not yet been added. Select only the Constrovet account and domain when creating it.
 
 If zone creation returns `403`, the safest beginner route is:
 
@@ -43,7 +43,7 @@ If zone creation returns `403`, the safest beginner route is:
 4. Stop at the DNS review screen; do not change Namecheap nameservers.
 5. Rerun `./scripts/go-live.sh dns-onboard` so the CLI validates and completes the three preserved records.
 
-Alternatively, recreate the API token with **Account → Zone → Edit** and **Zone → DNS → Edit** permissions scoped to the Constrovet account. Never grant global account access when a narrower scope is available.
+Alternatively, recreate the API token with **Account → Zone → Edit**, **Zone → DNS → Edit**, and **Zone → Zone Rulesets → Edit** permissions scoped to the Constrovet account and domain. Never grant global account access when a narrower scope is available.
 
 ## Change Namecheap nameservers
 
@@ -68,7 +68,7 @@ Every 15–30 minutes run:
 ./scripts/go-live.sh dns-status
 ```
 
-This checks Cloudflare nameservers, the exact `app`, `www`, and MX values, and HTTPS for both public services. Activation can take up to 24 hours.
+This checks Cloudflare nameservers, the proxied `app` record, exact `www` and MX values, HTTPS, and the complete `301` redirect to `https://www.constrovet.com/app/`. Universal SSL issuance can take up to 24 hours after activation.
 
 After the command passes, manually test inbound and outbound email again. Then record acceptance:
 

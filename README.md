@@ -51,7 +51,7 @@ git pull --ff-only
 ./scripts/go-live.sh deploy
 ```
 
-`dns-onboard` idempotently creates or reuses the Cloudflare zone and preserves the approved `app`, `www`, and legacy Google MX records as DNS-only. It aborts on conflicts and prints the exact nameservers for the owner to enter manually. `provision` then creates D1, private R2, receipt and dead-letter queues, Turnstile, the reviewer Access application, and the landing DNS record. The CLI saves only non-secret state under `~/.config/challanse/`; credentials are held in memory or sent directly to GitHub environment secrets. It never changes Namecheap nameservers itself.
+`dns-onboard` idempotently creates or reuses the Cloudflare zone, preserves `www` and the legacy Google MX record as DNS-only, and replaces the retired `app` origin with a proxied `301` redirect to `https://www.constrovet.com/app/`. It aborts on conflicts and prints the exact nameservers for the owner to enter manually. `provision` then creates D1, private R2, receipt and dead-letter queues, Turnstile, the reviewer Access application, and the landing DNS record. The CLI saves only non-secret state under `~/.config/challanse/`; credentials are held in memory or sent directly to GitHub environment secrets. It never changes Namecheap nameservers itself.
 
 Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `production` environment with required reviewer approval and the remaining values:
 
@@ -71,7 +71,7 @@ Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `produ
 | Secret | `CHALLANSE_KEY_ALIAS` |
 | Secret | `CHALLANSE_KEY_PASSWORD` |
 
-The Cloudflare token needs Zone Read, Zone DNS Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
+The Cloudflare token needs Zone Read, Zone DNS Edit, Zone Rulesets Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
 
 ## Seed a real site
 

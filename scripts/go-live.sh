@@ -59,6 +59,9 @@ cf() {
       printf '%s\n' 'The token cannot create this zone. Either add constrovet.com in the Cloudflare dashboard first, or create a token with Account > Zone > Edit and Zone > DNS > Edit permissions for the Constrovet account.' >&2
       printf '%s\n' 'After the dashboard shows constrovet.com, rerun dns-onboard. Do not change Namecheap nameservers yet.' >&2
     fi
+    if [[ "$path" == *'/rulesets'* ]]; then
+      printf '%s\n' 'The token must include Zone > Zone Rulesets > Edit for constrovet.com so the approved app redirect can be created.' >&2
+    fi
     die "Cloudflare API request failed: $method $path"
   fi
   printf '%s' "$response"
@@ -111,6 +114,56 @@ ensure_preserved_dns_record() {
   printf 'Preserved record already correct: %s %s -> %s\n' "$type" "$name" "$content"
 }
 
+ensure_app_redirect_dns() {
+  local records count existing record_id proxied body
+  records="$(cf GET "/zones/$ZONE_ID/dns_records?name=app.constrovet.com")"
+  count="$(jq '.result | length' <<<"$records")"
+  if [[ "$count" == "0" ]]; then
+    body="$(jq -nc '{type:"A",name:"app",content:"34.102.192.38",ttl:1,proxied:true}')"
+    cf POST "/zones/$ZONE_ID/dns_records" "$body" >/dev/null
+    printf 'Created proxied app record for the approved redirect.\n'
+    return
+  fi
+  [[ "$count" == "1" ]] || die "Multiple Cloudflare records exist for app.constrovet.com. Review them manually; nothing was changed."
+  existing="$(jq -r '.result[0] | [.type,.content] | join("|")' <<<"$records")"
+  [[ "$existing" == "A|34.102.192.38" ]] || die "Conflicting app record: $existing. Expected legacy A|34.102.192.38 before redirect activation."
+  record_id="$(jq -r '.result[0].id' <<<"$records")"
+  proxied="$(jq -r '.result[0].proxied' <<<"$records")"
+  if [[ "$proxied" != "true" ]]; then
+    cf PATCH "/zones/$ZONE_ID/dns_records/$record_id" '{"proxied":true}' >/dev/null
+    printf 'Enabled Cloudflare proxy for app.constrovet.com.\n'
+  else
+    printf 'Proxied app record already correct.\n'
+  fi
+}
+
+ensure_app_redirect_rule() {
+  local description expression target rule rulesets ruleset_id details conflicts existing body
+  description='Redirect retired app host to active static dashboard'
+  expression='(http.host eq "app.constrovet.com")'
+  target='https://www.constrovet.com/app/'
+  rule="$(jq -nc --arg description "$description" --arg expression "$expression" --arg target "$target" '{action:"redirect",action_parameters:{from_value:{status_code:301,target_url:{value:$target},preserve_query_string:true}},expression:$expression,description:$description,enabled:true}')"
+  rulesets="$(cf GET "/zones/$ZONE_ID/rulesets")"
+  ruleset_id="$(jq -r '.result[]? | select(.kind == "zone" and .phase == "http_request_dynamic_redirect") | .id' <<<"$rulesets" | head -1)"
+  if [[ -z "$ruleset_id" ]]; then
+    body="$(jq -nc --argjson rule "$rule" '{name:"ChallanSe managed redirects",kind:"zone",phase:"http_request_dynamic_redirect",rules:[$rule]}')"
+    cf POST "/zones/$ZONE_ID/rulesets" "$body" >/dev/null
+    printf 'Created 301 redirect: app.constrovet.com -> %s\n' "$target"
+    return
+  fi
+  details="$(cf GET "/zones/$ZONE_ID/rulesets/$ruleset_id")"
+  conflicts="$(jq --arg host app.constrovet.com --arg description "$description" '[.result.rules[]? | select((.expression | contains($host)) and .description != $description)] | length' <<<"$details")"
+  [[ "$conflicts" == "0" ]] || die "Another redirect rule already handles app.constrovet.com. Review it manually; nothing was changed."
+  existing="$(jq -c --arg description "$description" '.result.rules[]? | select(.description == $description)' <<<"$details" | head -1)"
+  if [[ -z "$existing" ]]; then
+    cf POST "/zones/$ZONE_ID/rulesets/$ruleset_id/rules" "$rule" >/dev/null
+    printf 'Added 301 redirect: app.constrovet.com -> %s\n' "$target"
+    return
+  fi
+  jq -e --arg expression "$expression" --arg target "$target" '.action == "redirect" and .enabled == true and .expression == $expression and .action_parameters.from_value.status_code == 301 and .action_parameters.from_value.target_url.value == $target and .action_parameters.from_value.preserve_query_string == true' >/dev/null <<<"$existing" || die "The managed app redirect exists but differs from the approved 301 target. Review it manually; nothing was changed."
+  printf 'App redirect rule already correct.\n'
+}
+
 dns_onboard() {
   for command in jq curl git; do need "$command"; done
   [[ -z "$(git status --porcelain)" ]] || die "Git working tree is not clean."
@@ -125,9 +178,10 @@ dns_onboard() {
     [[ -n "$ZONE_ID" ]] || die "Cloudflare did not return a zone ID."
   fi
   save_state ZONE_ID "$ZONE_ID"
-  ensure_preserved_dns_record A app.constrovet.com 34.102.192.38
+  ensure_app_redirect_dns
   ensure_preserved_dns_record CNAME www.constrovet.com tcbhagat.github.io
   ensure_preserved_dns_record MX constrovet.com alt4.aspmx.l.google.com 10
+  ensure_app_redirect_rule
 
   local zone nameserver_one nameserver_two
   zone="$(cf GET "/zones/$ZONE_ID")"
@@ -160,7 +214,7 @@ dns_status() {
   for command in jq curl dig; do need "$command"; done
   load_state
   [[ -n "${CLOUDFLARE_NAMESERVER_1:-}" && -n "${CLOUDFLARE_NAMESERVER_2:-}" ]] || die "Run dns-onboard first."
-  local ns app_record www_record mx_record www_status app_status
+  local ns app_record www_record mx_record www_status app_status app_result app_final
   ns="$(dig @1.1.1.1 NS constrovet.com +short | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort)"
   if ! grep -Fxq "${CLOUDFLARE_NAMESERVER_1,,}" <<<"$ns" || ! grep -Fxq "${CLOUDFLARE_NAMESERVER_2,,}" <<<"$ns"; then
     printf 'Cloudflare is still waiting for the nameserver change. Current public nameservers:\n%s\n' "$ns" >&2
@@ -169,13 +223,15 @@ dns_status() {
   app_record="$(dig @1.1.1.1 A app.constrovet.com +short | sort)"
   www_record="$(dig @1.1.1.1 CNAME www.constrovet.com +short | tr '[:upper:]' '[:lower:]')"
   mx_record="$(dig @1.1.1.1 MX constrovet.com +short | tr '[:upper:]' '[:lower:]')"
-  [[ "$app_record" == "34.102.192.38" ]] || die "app.constrovet.com changed: $app_record"
+  [[ -n "$app_record" && "$app_record" != "34.102.192.38" ]] || die "app.constrovet.com is not using the Cloudflare proxy yet: $app_record"
   [[ "$www_record" == "tcbhagat.github.io." ]] || die "www.constrovet.com changed: $www_record"
   [[ "$mx_record" == "10 alt4.aspmx.l.google.com." ]] || die "Constrovet MX changed: $mx_record"
   www_status="$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' https://www.constrovet.com/)" || die "www.constrovet.com failed HTTPS validation."
-  app_status="$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' https://app.constrovet.com/)" || die "app.constrovet.com failed HTTPS validation."
-  [[ "$www_status" != "000" && "$app_status" != "000" ]] || die "A production service could not be reached over HTTPS."
-  printf 'DNS and HTTPS checks passed. www HTTP %s; app HTTP %s.\n' "$www_status" "$app_status"
+  app_status="$(curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}' https://app.constrovet.com/)" || die "app.constrovet.com HTTPS is not ready. Cloudflare certificate issuance can take up to 24 hours."
+  app_result="$(curl -sS -L --connect-timeout 10 --max-time 20 -o /dev/null -w '%{http_code}|%{url_effective}' https://app.constrovet.com/)" || die "The app redirect could not be followed."
+  app_final="${app_result#*|}"
+  [[ "$www_status" == "200" && "$app_status" == "301" && "$app_result" == "200|https://www.constrovet.com/app/" ]] || die "App redirect validation failed: initial HTTP $app_status; final $app_result"
+  printf 'DNS and HTTPS checks passed. www HTTP %s; app HTTP %s -> %s.\n' "$www_status" "$app_status" "$app_final"
   printf 'Now test email in both directions, then run: ./scripts/go-live.sh dns-accept\n'
 }
 
@@ -184,8 +240,8 @@ dns_accept() {
   local answer
   read -r -p 'Open www.constrovet.com with no certificate warning. Type WEBSITE OK: ' answer
   [[ "$answer" == "WEBSITE OK" ]] || die "Website acceptance was not confirmed."
-  read -r -p 'Open app.constrovet.com and confirm its normal service appears. Type APP OK: ' answer
-  [[ "$answer" == "APP OK" ]] || die "App acceptance was not confirmed."
+  read -r -p 'Open app.constrovet.com and confirm it redirects to www.constrovet.com/app/ with no warning. Type APP REDIRECT OK: ' answer
+  [[ "$answer" == "APP REDIRECT OK" ]] || die "App redirect acceptance was not confirmed."
   read -r -p 'Send and receive @constrovet.com email successfully. Type EMAIL BOTH DIRECTIONS OK: ' answer
   [[ "$answer" == "EMAIL BOTH DIRECTIONS OK" ]] || die "Email acceptance was not confirmed."
   save_state DNS_ACCEPTED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
