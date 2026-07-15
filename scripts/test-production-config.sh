@@ -19,7 +19,7 @@ grep -Fq 'alt4.aspmx.l.google.com' scripts/go-live.sh
 grep -Fq 'DNS_ACCEPTED_AT' scripts/go-live.sh
 grep -Fq 'Cloudflare error details:' scripts/go-live.sh
 grep -Fq 'Account > Zone > Edit' scripts/go-live.sh
-grep -Fq 'Zone > Zone Rulesets > Edit' scripts/go-live.sh
+grep -Fq 'Zone > Dynamic URL Redirects > Edit' scripts/go-live.sh
 grep -Fq 'https://www.constrovet.com/app/' scripts/go-live.sh
 grep -Fq 'APP REDIRECT OK' scripts/go-live.sh
 if rg -I -g '!test-production-config.sh' '(gho_[A-Za-z0-9]+|sk_live_[A-Za-z0-9]+|CLOUDFLARE_API_TOKEN=.{12})' scripts apps; then

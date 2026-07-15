@@ -60,7 +60,7 @@ cf() {
       printf '%s\n' 'After the dashboard shows constrovet.com, rerun dns-onboard. Do not change Namecheap nameservers yet.' >&2
     fi
     if [[ "$path" == *'/rulesets'* ]]; then
-      printf '%s\n' 'The token must include Zone > Zone Rulesets > Edit for constrovet.com so the approved app redirect can be created.' >&2
+      printf '%s\n' 'The token must include Zone > Dynamic URL Redirects > Edit for constrovet.com so the approved app redirect can be created.' >&2
     fi
     die "Cloudflare API request failed: $method $path"
   fi

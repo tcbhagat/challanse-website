@@ -71,7 +71,7 @@ Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `produ
 | Secret | `CHALLANSE_KEY_ALIAS` |
 | Secret | `CHALLANSE_KEY_PASSWORD` |
 
-The Cloudflare token needs Zone Read, Zone DNS Edit, Zone Rulesets Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
+The Cloudflare token needs Zone Read, Zone DNS Edit, Dynamic URL Redirects Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
 
 ## Seed a real site
 
