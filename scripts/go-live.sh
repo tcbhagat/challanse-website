@@ -16,7 +16,12 @@ touch "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 cd "$ROOT"
 
-load_state() { set -a; source "$STATE_FILE"; set +a; }
+load_state() {
+  set -a
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  set +a
+}
 save_state() {
   local name="$1" value="$2" temporary
   temporary="$(mktemp "$STATE_DIR/state.XXXXXX")"
@@ -522,12 +527,144 @@ configure_github() {
   printf 'GitHub production secrets and Android signing are configured.\nCertificate SHA-256: %s\nBack up %s offline.\n' "$fingerprint" "$keystore"
 }
 
+configure_enrichment() {
+  preflight
+  need aws
+  local enrichment_url access_client_id access_client_secret edge_key edge_next_key service_key service_next_key edge_key_id edge_next_key_id service_key_id service_next_key_id runtime_secret_arn runtime_json updated_runtime timestamp
+  if github_environment_secret_exists EDGE_TO_ENRICHMENT_HMAC_KEY || github_environment_secret_exists EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY || github_environment_secret_exists ENRICHMENT_TO_EDGE_HMAC_KEY || github_environment_secret_exists ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY; then
+    die "Directional enrichment keys already exist. Use the documented dual-key rotation procedure; configure-enrichment never replaces active keys."
+  fi
+  prompt_value ENRICHMENT_URL "Cloudflare Access-protected enrichment URL"
+  enrichment_url="${ENRICHMENT_URL:-}"
+  [[ "$enrichment_url" =~ ^https://[A-Za-z0-9.-]+$ ]] || die "Enrichment URL must be an HTTPS origin without a path."
+  prompt_secret ENRICHMENT_ACCESS_CLIENT_ID "Cloudflare Access service-token client ID"
+  prompt_secret ENRICHMENT_ACCESS_CLIENT_SECRET "Cloudflare Access service-token client secret"
+  prompt_value AWS_RUNTIME_SECRET_ARN "AWS enrichment runtime secret ARN"
+  prompt_value AWS_DEAD_LETTER_QUEUE_URL "AWS receipt dead-letter queue URL"
+  access_client_id="$ENRICHMENT_ACCESS_CLIENT_ID"
+  access_client_secret="$ENRICHMENT_ACCESS_CLIENT_SECRET"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  edge_key="$(openssl rand -hex 32)"
+  edge_next_key="$(openssl rand -hex 32)"
+  service_key="$(openssl rand -hex 32)"
+  service_next_key="$(openssl rand -hex 32)"
+  edge_key_id="edge-${timestamp}-current"
+  edge_next_key_id="edge-${timestamp}-next"
+  service_key_id="service-${timestamp}-current"
+  service_next_key_id="service-${timestamp}-next"
+  runtime_secret_arn="$AWS_RUNTIME_SECRET_ARN"
+  runtime_json="$(aws secretsmanager get-secret-value --secret-id "$runtime_secret_arn" --query SecretString --output text)"
+  jq -e '.DATABASE_URL | type == "string" and length > 0' >/dev/null <<<"$runtime_json" || die "AWS runtime secret does not contain the Terraform-created DATABASE_URL."
+  updated_runtime="$(jq -c \
+    --arg cloudflare_api_url https://api.challanse.constrovet.com \
+    --arg edge_key_id "$edge_key_id" --arg edge_key "$edge_key" \
+    --arg edge_next_key_id "$edge_next_key_id" --arg edge_next_key "$edge_next_key" \
+    --arg service_key_id "$service_key_id" --arg service_key "$service_key" \
+    --arg service_next_key_id "$service_next_key_id" --arg service_next_key "$service_next_key" \
+    --arg access_id "$access_client_id" --arg access_secret "$access_client_secret" \
+    '. + {CLOUDFLARE_API_URL:$cloudflare_api_url,EDGE_TO_ENRICHMENT_HMAC_KEY_ID:$edge_key_id,EDGE_TO_ENRICHMENT_HMAC_KEY:$edge_key,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID:$edge_next_key_id,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY:$edge_next_key,ENRICHMENT_TO_EDGE_HMAC_KEY_ID:$service_key_id,ENRICHMENT_TO_EDGE_HMAC_KEY:$service_key,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID:$service_next_key_id,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY:$service_next_key,CLOUDFLARE_ACCESS_CLIENT_ID:$access_id,CLOUDFLARE_ACCESS_CLIENT_SECRET:$access_secret}' <<<"$runtime_json")"
+  aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string "$updated_runtime" >/dev/null
+  printf '%s' "$edge_key" | gh secret set EDGE_TO_ENRICHMENT_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$edge_next_key" | gh secret set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$service_key" | gh secret set ENRICHMENT_TO_EDGE_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$service_next_key" | gh secret set ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$access_client_id" | gh secret set ENRICHMENT_ACCESS_CLIENT_ID --repo "$REPO" --env production
+  printf '%s' "$access_client_secret" | gh secret set ENRICHMENT_ACCESS_CLIENT_SECRET --repo "$REPO" --env production
+  gh variable set ENRICHMENT_URL --repo "$REPO" --env production --body "$enrichment_url"
+  gh variable set EDGE_TO_ENRICHMENT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_key_id"
+  gh variable set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_next_key_id"
+  gh variable set ENRICHMENT_TO_EDGE_HMAC_KEY_ID --repo "$REPO" --env production --body "$service_key_id"
+  gh variable set ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID --repo "$REPO" --env production --body "$service_next_key_id"
+  gh variable set AWS_RUNTIME_SECRET_ARN --repo "$REPO" --env production --body "$runtime_secret_arn"
+  gh variable set AWS_DEAD_LETTER_QUEUE_URL --repo "$REPO" --env production --body "$AWS_DEAD_LETTER_QUEUE_URL"
+  save_state ENRICHMENT_URL "$enrichment_url"
+  save_state EDGE_TO_ENRICHMENT_HMAC_KEY_ID "$edge_key_id"
+  save_state EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID "$edge_next_key_id"
+  save_state ENRICHMENT_TO_EDGE_HMAC_KEY_ID "$service_key_id"
+  save_state ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID "$service_next_key_id"
+  unset edge_key edge_next_key service_key service_next_key access_client_id access_client_secret runtime_json updated_runtime ENRICHMENT_ACCESS_CLIENT_SECRET
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  printf '%s\n' 'Directional HMAC keys and Access service credentials were sent directly to GitHub and AWS Secrets Manager; they were not saved locally.'
+}
+
+rotate_enrichment_keys() {
+  preflight
+  need aws
+  local mode="${1:-}" runtime_secret_arn runtime_json updated_runtime confirmation timestamp
+  local edge_key_id edge_key edge_next_key_id edge_next_key service_key_id service_key service_next_key_id service_next_key
+  [[ "$mode" == "stage" || "$mode" == "promote" ]] || die "Usage: $0 rotate-enrichment-keys stage|promote"
+  runtime_secret_arn="$(github_environment_variable AWS_RUNTIME_SECRET_ARN)"
+  [[ -n "$runtime_secret_arn" ]] || die "AWS_RUNTIME_SECRET_ARN is missing from the production environment."
+  runtime_json="$(aws secretsmanager get-secret-value --secret-id "$runtime_secret_arn" --query SecretString --output text)"
+  jq -e '[.EDGE_TO_ENRICHMENT_HMAC_KEY_ID,.EDGE_TO_ENRICHMENT_HMAC_KEY,.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID,.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY,.ENRICHMENT_TO_EDGE_HMAC_KEY_ID,.ENRICHMENT_TO_EDGE_HMAC_KEY,.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID,.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY] | all(type == "string" and length > 0)' >/dev/null <<<"$runtime_json" || die "AWS runtime secret does not contain a complete active/next directional key set."
+  edge_key_id="$(jq -r .EDGE_TO_ENRICHMENT_HMAC_KEY_ID <<<"$runtime_json")"
+  edge_key="$(jq -r .EDGE_TO_ENRICHMENT_HMAC_KEY <<<"$runtime_json")"
+  edge_next_key_id="$(jq -r .EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID <<<"$runtime_json")"
+  edge_next_key="$(jq -r .EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY <<<"$runtime_json")"
+  service_key_id="$(jq -r .ENRICHMENT_TO_EDGE_HMAC_KEY_ID <<<"$runtime_json")"
+  service_key="$(jq -r .ENRICHMENT_TO_EDGE_HMAC_KEY <<<"$runtime_json")"
+  service_next_key_id="$(jq -r .ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID <<<"$runtime_json")"
+  service_next_key="$(jq -r .ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY <<<"$runtime_json")"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ "$mode" == "stage" ]]; then
+    read -r -p 'Type STAGE ENRICHMENT KEYS to generate replacement next keys: ' confirmation
+    [[ "$confirmation" == "STAGE ENRICHMENT KEYS" ]] || die "Enrichment key staging cancelled."
+    edge_next_key_id="edge-${timestamp}-next"
+    edge_next_key="$(openssl rand -hex 32)"
+    service_next_key_id="service-${timestamp}-next"
+    service_next_key="$(openssl rand -hex 32)"
+  else
+    read -r -p 'Type PROMOTE ENRICHMENT KEYS to swap active and next keys: ' confirmation
+    [[ "$confirmation" == "PROMOTE ENRICHMENT KEYS" ]] || die "Enrichment key promotion cancelled."
+    local previous_edge_key_id="$edge_key_id" previous_edge_key="$edge_key" previous_service_key_id="$service_key_id" previous_service_key="$service_key"
+    edge_key_id="$edge_next_key_id"; edge_key="$edge_next_key"; edge_next_key_id="$previous_edge_key_id"; edge_next_key="$previous_edge_key"
+    service_key_id="$service_next_key_id"; service_key="$service_next_key"; service_next_key_id="$previous_service_key_id"; service_next_key="$previous_service_key"
+  fi
+  updated_runtime="$(jq -c \
+    --arg edge_key_id "$edge_key_id" --arg edge_key "$edge_key" --arg edge_next_key_id "$edge_next_key_id" --arg edge_next_key "$edge_next_key" \
+    --arg service_key_id "$service_key_id" --arg service_key "$service_key" --arg service_next_key_id "$service_next_key_id" --arg service_next_key "$service_next_key" \
+    '. + {EDGE_TO_ENRICHMENT_HMAC_KEY_ID:$edge_key_id,EDGE_TO_ENRICHMENT_HMAC_KEY:$edge_key,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID:$edge_next_key_id,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY:$edge_next_key,ENRICHMENT_TO_EDGE_HMAC_KEY_ID:$service_key_id,ENRICHMENT_TO_EDGE_HMAC_KEY:$service_key,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID:$service_next_key_id,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY:$service_next_key}' <<<"$runtime_json")"
+  aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string "$updated_runtime" >/dev/null
+  printf '%s' "$edge_key" | gh secret set EDGE_TO_ENRICHMENT_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$edge_next_key" | gh secret set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$service_key" | gh secret set ENRICHMENT_TO_EDGE_HMAC_KEY --repo "$REPO" --env production
+  printf '%s' "$service_next_key" | gh secret set ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY --repo "$REPO" --env production
+  gh variable set EDGE_TO_ENRICHMENT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_key_id"
+  gh variable set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_next_key_id"
+  gh variable set ENRICHMENT_TO_EDGE_HMAC_KEY_ID --repo "$REPO" --env production --body "$service_key_id"
+  gh variable set ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID --repo "$REPO" --env production --body "$service_next_key_id"
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  unset edge_key edge_next_key service_key service_next_key runtime_json updated_runtime
+  printf 'Directional enrichment keys %sd. Production remains disabled; deploy the overlap set before the next phase.\n' "$mode"
+}
+
+configure_aws() {
+  preflight
+  local variables name label value
+  variables='AWS_PRODUCTION_ACCOUNT_ID AWS_PRODUCTION_TERRAFORM_ROLE_ARN AWS_ECR_REPOSITORY AWS_ADOT_COLLECTOR_IMAGE AWS_TERRAFORM_STATE_BUCKET AWS_TERRAFORM_STATE_KMS_KEY_ARN AWS_ENRICHMENT_CERTIFICATE_ARN AWS_MONTHLY_BUDGET_USD AWS_BUDGET_EMAIL AWS_GITHUB_OIDC_PROVIDER_ARN'
+  for name in $variables; do
+    label="${name//_/ }"
+    prompt_value "$name" "$label"
+    value="${!name}"
+    gh variable set "$name" --repo "$REPO" --env production --body "$value"
+  done
+  gh variable set AWS_ENRICHMENT_BOOTSTRAPPED --repo "$REPO" --env production --body false
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  printf '%s\n' 'AWS deployment variables are configured. Run the Terraform bootstrap with services_enabled=false, populate the AWS runtime secret, then set AWS_ENRICHMENT_BOOTSTRAPPED=true.'
+}
+
 rotate_signing() {
   preflight
   command -v keytool >/dev/null 2>&1 || die "keytool is required. On Ubuntu run: sudo apt update && sudo apt install -y openjdk-17-jdk-headless"
   load_state
-  local old_keystore="${SIGNING_KEYSTORE_PATH:-}" old_fingerprint="${SIGNING_CERT_SHA256:-}" keystore password password_confirm fingerprint encoded confirmation
+  local old_keystore="${SIGNING_KEYSTORE_PATH:-}" old_fingerprint="${SIGNING_CERT_SHA256:-}" keystore password password_confirm fingerprint encoded confirmation backup_dir backup_path backup_password backup_password_confirm
   [[ -n "$old_keystore" && -n "$old_fingerprint" ]] || die "Existing signing state is missing. Run configure-github instead."
+  if git rev-list --objects --all | awk '{print $2}' | grep -Eiq '\.(jks|keystore)$'; then
+    die "A keystore path exists in Git history. Remove it from history and rotate any affected credentials before continuing."
+  fi
+  if find "$ROOT" -type f \( -name '*.jks' -o -name '*.keystore' \) -print -quit | grep -q .; then
+    die "A keystore exists inside the repository working tree. Remove it securely before continuing."
+  fi
   printf 'Exposed signing certificate SHA-256: %s\n' "$old_fingerprint"
   read -r -p 'Type ROTATE EXPOSED SIGNING KEY to continue: ' confirmation
   [[ "$confirmation" == "ROTATE EXPOSED SIGNING KEY" ]] || die "Signing rotation cancelled."
@@ -541,6 +678,17 @@ rotate_signing() {
   chmod 600 "$keystore"
   fingerprint="$(signing_fingerprint "$keystore" "$password")"
   [[ "$fingerprint" =~ ^[0-9A-F]{64}$ && "$fingerprint" != "$old_fingerprint" ]] || die "Replacement signing identity is invalid or unchanged."
+  read -r -p "Mounted offline-backup directory (outside this repository): " backup_dir
+  backup_dir="$(realpath -e "$backup_dir")"
+  [[ -d "$backup_dir" && -w "$backup_dir" && "$backup_dir" != "$ROOT"/* && "$backup_dir" != "$STATE_DIR"/* ]] || die "Backup directory must exist, be writable, and be outside the repository and live key directory."
+  backup_path="$backup_dir/$(basename "$keystore").enc"
+  [[ ! -e "$backup_path" ]] || die "Encrypted backup already exists: $backup_path"
+  read -r -s -p "Separate offline-backup password: " backup_password; printf '\n'
+  read -r -s -p "Repeat offline-backup password: " backup_password_confirm; printf '\n'
+  [[ -n "$backup_password" && "$backup_password" == "$backup_password_confirm" && "$backup_password" != "$password" ]] || die "Backup passwords do not match or reuse the signing password."
+  openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$keystore" -out "$backup_path" -pass fd:3 3<<<"$backup_password"
+  chmod 600 "$backup_path"
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$backup_path" -pass fd:3 3<<<"$backup_password" | cmp -s - "$keystore" || die "Encrypted signing backup verification failed."
   encoded="$(base64 -w0 "$keystore")"
   printf '%s' "$encoded" | gh secret set CHALLANSE_KEYSTORE_BASE64 --repo "$REPO" --env production
   printf '%s' "$password" | gh secret set CHALLANSE_KEYSTORE_PASSWORD --repo "$REPO" --env production
@@ -550,22 +698,24 @@ rotate_signing() {
   gh variable set CHALLANSE_SIGNING_CERT_SHA256 --repo "$REPO" --env production --body "$fingerprint"
   save_state SIGNING_KEYSTORE_PATH "$keystore"
   save_state SIGNING_CERT_SHA256 "$fingerprint"
+  save_state SIGNING_ENCRYPTED_BACKUP_PATH "$backup_path"
   if [[ -f "$old_keystore" ]]; then shred -u -- "$old_keystore"; fi
-  unset password password_confirm encoded CLOUDFLARE_API_TOKEN
-  printf 'Signing identity rotated. New certificate SHA-256: %s\nBack up %s offline and never open it in an editor.\n' "$fingerprint" "$keystore"
+  unset password password_confirm backup_password backup_password_confirm encoded CLOUDFLARE_API_TOKEN
+  printf 'Signing identity rotated. New certificate SHA-256: %s\nLive key: %s\nVerified encrypted offline backup: %s\nStore the backup password separately and never open a .jks file in an editor.\n' "$fingerprint" "$keystore" "$backup_path"
 }
 
 deploy() {
   preflight
   local required_secrets required_variables run_id pending ids body deployment_flag commit_sha confirmation github_fingerprint
-  required_secrets='["CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_API_TOKEN","DEVICE_TOKEN_PEPPER","TURNSTILE_SECRET","CHALLANSE_KEYSTORE_BASE64","CHALLANSE_KEYSTORE_PASSWORD","CHALLANSE_KEY_ALIAS","CHALLANSE_KEY_PASSWORD"]'
-  required_variables='["CLOUDFLARE_D1_DATABASE_ID","CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","TURNSTILE_SITE_KEY","CHALLANSE_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256"]'
+  required_secrets='["CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_API_TOKEN","DEVICE_TOKEN_PEPPER","TURNSTILE_SECRET","CHALLANSE_KEYSTORE_BASE64","CHALLANSE_KEYSTORE_PASSWORD","CHALLANSE_KEY_ALIAS","CHALLANSE_KEY_PASSWORD","EDGE_TO_ENRICHMENT_HMAC_KEY","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY","ENRICHMENT_TO_EDGE_HMAC_KEY","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY","ENRICHMENT_ACCESS_CLIENT_ID","ENRICHMENT_ACCESS_CLIENT_SECRET"]'
+  required_variables='["CLOUDFLARE_D1_DATABASE_ID","CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","TURNSTILE_SITE_KEY","CHALLANSE_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256","ENRICHMENT_URL","EDGE_TO_ENRICHMENT_HMAC_KEY_ID","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID","AWS_PRODUCTION_ACCOUNT_ID","AWS_PRODUCTION_TERRAFORM_ROLE_ARN","AWS_ECR_REPOSITORY","AWS_ADOT_COLLECTOR_IMAGE","AWS_TERRAFORM_STATE_BUCKET","AWS_TERRAFORM_STATE_KMS_KEY_ARN","AWS_ENRICHMENT_CERTIFICATE_ARN","AWS_MONTHLY_BUDGET_USD","AWS_BUDGET_EMAIL","AWS_GITHUB_OIDC_PROVIDER_ARN","AWS_RUNTIME_SECRET_ARN","AWS_DEAD_LETTER_QUEUE_URL","AWS_ENRICHMENT_BOOTSTRAPPED","STAGING_ACCEPTANCE_SHA256","ANDROID_FIELD_ACCEPTANCE_SHA256"]'
   jq -e --argjson required "$required_secrets" '($required - [.[].name]) | length == 0' >/dev/null < <(gh secret list --repo "$REPO" --env production --json name) || die "Required production secrets are missing."
   jq -e --argjson required "$required_variables" '($required - [.[].name]) | length == 0' >/dev/null < <(gh variable list --repo "$REPO" --env production --json name) || die "Required production variables are missing."
   local revoked_fingerprint
   revoked_fingerprint="$(github_environment_variable CHALLANSE_REVOKED_SIGNING_CERT_SHA256)"
   github_fingerprint="$(github_environment_variable CHALLANSE_SIGNING_CERT_SHA256)"
   [[ -n "$revoked_fingerprint" && -n "$github_fingerprint" && "$revoked_fingerprint" != "$github_fingerprint" ]] || die "Rotate the exposed Android signing identity before deployment: ./scripts/go-live.sh rotate-signing"
+  [[ "$(github_environment_variable AWS_ENRICHMENT_BOOTSTRAPPED)" == "true" ]] || die "AWS enrichment is not bootstrapped. Keep services stopped, populate the runtime secret, validate staging, then set AWS_ENRICHMENT_BOOTSTRAPPED=true."
   deployment_flag="$(gh variable list --repo "$REPO" --json name,value --jq '.[] | select(.name == "PILOT_DEPLOY_ENABLED") | .value')"
   [[ "$deployment_flag" == "false" ]] || die "PILOT_DEPLOY_ENABLED must be false before deployment. Run rollback-production.sh first."
   load_state
@@ -600,6 +750,40 @@ deploy() {
   printf 'Production workflow completed successfully: https://github.com/%s/actions/runs/%s\n' "$REPO" "$run_id"
 }
 
+accept_staging() {
+  local report="${1:-}"
+  [[ -r "$report" ]] || die "Usage: $0 accept-staging /secure/staging-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and .synthetic_receipts >= 20 and .lost_receipts == 0 and
+    .duplicate_receipts == 0 and .cross_site_access_denied == true and .callback_replay_denied == true and
+    .dlq_replay_passed == true and .rollback_passed == true
+  ' "$report" >/dev/null || die "Staging report does not satisfy the required release gates."
+  local digest confirmation
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT STAGING $digest after reviewing the report: " confirmation
+  [[ "$confirmation" == "ACCEPT STAGING $digest" ]] || die "Staging acceptance cancelled."
+  gh variable set STAGING_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Staging acceptance evidence recorded: %s\n' "$digest"
+}
+
+accept_android_field() {
+  local report="${1:-}"
+  [[ -r "$report" ]] || die "Usage: $0 accept-android-field /secure/android-field-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and .android_api_level == 26 and .device_ram_mb <= 2048 and .binary_writes >= 100 and
+    .minimum_image_bytes <= 500000 and .maximum_image_bytes >= 5000000 and .p95_write_ms < 50 and
+    .metadata_loss_count == 0 and .sqlcipher_status_verified == true and .wrong_key_rejected == true and
+    .raw_database_scan_clean == true and .restart_recovery_passed == true and .reboot_sync_passed == true and
+    .interrupted_upload_resume_passed == true
+  ' "$report" >/dev/null || die "Android field report does not satisfy encryption, durability, and p95 gates."
+  local digest confirmation
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT ANDROID $digest after reviewing device evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT ANDROID $digest" ]] || die "Android field acceptance cancelled."
+  gh variable set ANDROID_FIELD_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Android field acceptance evidence recorded: %s\n' "$digest"
+}
+
 rotate_device_pepper() {
   preflight
   load_state
@@ -614,6 +798,24 @@ rotate_device_pepper() {
   printf '%s' "$pepper" | gh secret set DEVICE_TOKEN_PEPPER --repo "$REPO" --env production
   unset pepper CLOUDFLARE_API_TOKEN
   printf 'Device pepper rotated and all cloud device credentials revoked. Re-enroll pilot devices before syncing.\n'
+}
+
+replay_dlq() {
+  need aws
+  need jq
+  local queue_url queue_arn count confirmation task
+  queue_url="$(github_environment_variable AWS_DEAD_LETTER_QUEUE_URL)"
+  [[ -n "$queue_url" ]] || prompt_value queue_url "AWS receipt dead-letter queue URL"
+  queue_arn="$(aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)"
+  count="$(aws sqs get-queue-attributes --queue-url "$queue_url" --attribute-names ApproximateNumberOfMessages --query 'Attributes.ApproximateNumberOfMessages' --output text)"
+  [[ "$queue_arn" == arn:aws:sqs:ap-south-1:*:challanse-production-receipts-dlq ]] || die "DLQ ARN is not the expected ChallanSe production queue."
+  [[ "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]] || die "The ChallanSe dead-letter queue has no visible messages."
+  printf 'Dead-letter messages available: %s\n' "$count"
+  read -r -p "Type REPLAY DLQ $count to redrive them through idempotent processing: " confirmation
+  [[ "$confirmation" == "REPLAY DLQ $count" ]] || die "DLQ replay cancelled."
+  task="$(aws sqs start-message-move-task --source-arn "$queue_arn" --max-number-of-messages-per-second 1 --output json)"
+  jq -e '.TaskHandle | type == "string" and length > 0' >/dev/null <<<"$task" || die "AWS did not start the DLQ replay."
+  printf 'DLQ replay started at one message per second. Monitor the DLQ and workflow-stage alarms before increasing throughput.\n'
 }
 
 https_status() {
@@ -643,7 +845,7 @@ harden_github() {
   [[ "$approvals" == "1" ]] || printf '%s\n' 'Only one push-capable maintainer is available, so independent review cannot yet be enforced.'
   read -r -p 'Type HARDEN MAIN to apply these repository rules: ' confirmation
   [[ "$confirmation" == "HARDEN MAIN" ]] || die "Branch protection unchanged."
-  body="$(jq -nc --argjson approvals "$approvals" '{required_status_checks:{strict:true,contexts:["validate","android"]},enforce_admins:true,required_pull_request_reviews:{dismiss_stale_reviews:true,require_code_owner_reviews:false,required_approving_review_count:$approvals,require_last_push_approval:false},restrictions:null,required_conversation_resolution:true,allow_force_pushes:false,allow_deletions:false}')"
+  body="$(jq -nc --argjson approvals "$approvals" '{required_status_checks:{strict:true,contexts:["validate","android","enrichment","security","integration","terraform-plan"]},enforce_admins:true,required_pull_request_reviews:{dismiss_stale_reviews:true,require_code_owner_reviews:false,required_approving_review_count:$approvals,require_last_push_approval:false},restrictions:null,required_conversation_resolution:true,allow_force_pushes:false,allow_deletions:false,required_linear_history:true}')"
   gh api --method PUT "repos/$REPO/branches/main/protection" --input - <<<"$body" >/dev/null
   printf 'Main branch protection hardened. Add a second maintainer to enforce one independent approval.\n'
 }
@@ -730,11 +932,17 @@ Usage: scripts/go-live.sh <command>
   preflight
   provision
   configure-github
+  configure-enrichment
+  rotate-enrichment-keys stage|promote
+  configure-aws
   rotate-signing
   harden-github
   deploy
+  accept-staging /secure/staging-acceptance.json
+  accept-android-field /secure/android-field-acceptance.json
   https-status
   rotate-device-pepper
+  replay-dlq
   seed --vendors-file /secure/challanse-vendors.json
   verify
   download-apk
@@ -749,11 +957,17 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     preflight) preflight ;;
     provision) provision ;;
     configure-github) configure_github ;;
+    configure-enrichment) configure_enrichment ;;
+    rotate-enrichment-keys) rotate_enrichment_keys "${2:-}" ;;
+    configure-aws) configure_aws ;;
     rotate-signing) rotate_signing ;;
     harden-github) harden_github ;;
     deploy) deploy ;;
+    accept-staging) accept_staging "${2:-}" ;;
+    accept-android-field) accept_android_field "${2:-}" ;;
     https-status) https_status ;;
     rotate-device-pepper) rotate_device_pepper ;;
+    replay-dlq) replay_dlq ;;
     seed) shift; seed "$@" ;;
     verify) verify ;;
     download-apk) download_apk ;;

@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import QRCode from 'qrcode';
-import type { ReceiptListItem, ReceiptReview, ReceiptStatus } from '@challanse/contracts';
+import type { ReceiptListItem, ReceiptReview, ReceiptStatus, ReconciliationRow } from '@challanse/contracts';
 import {
   API_BASE_URL,
   PUBLIC_API_URL,
   ApiError,
   createEnrollmentCode,
   getAdminSummary,
+  importPurchaseOrders,
   listReceipts,
+  listReconciliation,
   reviewReceipt,
   revokeDevice,
   type AdminSummary,
@@ -25,6 +27,8 @@ function formatTime(unix: number) {
 
 function ReceiptCard({ receipt, onSaved }: { receipt: ReceiptListItem; onSaved: () => void }) {
   const [challanNumber, setChallanNumber] = useState(receipt.challanNumber);
+  const [poNumber, setPoNumber] = useState(receipt.poNumber);
+  const [materialCode, setMaterialCode] = useState(receipt.materialCode);
   const [description, setDescription] = useState(receipt.materialDescription);
   const [quantity, setQuantity] = useState(String(receipt.verifiedQuantity ?? receipt.capturedQuantity));
   const [unit, setUnit] = useState(receipt.unit || 'UNIT');
@@ -40,6 +44,8 @@ function ReceiptCard({ receipt, onSaved }: { receipt: ReceiptListItem; onSaved: 
         action,
         version: receipt.version,
         challanNumber,
+        poNumber,
+        materialCode,
         materialDescription: description,
         verifiedQuantity: Number(quantity),
         unit,
@@ -71,15 +77,51 @@ function ReceiptCard({ receipt, onSaved }: { receipt: ReceiptListItem; onSaved: 
       </details>
       <form className="review-form" onSubmit={(event) => { event.preventDefault(); void submit('VERIFY'); }}>
         <label>Challan number<input value={challanNumber} onChange={(event) => setChallanNumber(event.target.value)} disabled={!editable || busy} /></label>
+        <label>PO number<input required value={poNumber} onChange={(event) => setPoNumber(event.target.value.toUpperCase())} disabled={!editable || busy} /></label>
+        <label>Material code<input required value={materialCode} onChange={(event) => setMaterialCode(event.target.value.toUpperCase())} disabled={!editable || busy} /></label>
         <label className="wide">Material description<input required value={description} onChange={(event) => setDescription(event.target.value)} disabled={!editable || busy} /></label>
         <label>Verified quantity<input required type="number" min="0.001" step="any" value={quantity} onChange={(event) => setQuantity(event.target.value)} disabled={!editable || busy} /></label>
         <label>Unit<input required value={unit} onChange={(event) => setUnit(event.target.value.toUpperCase())} disabled={!editable || busy} /></label>
         <label className="wide">Notes<textarea value={notes} onChange={(event) => setNotes(event.target.value)} disabled={!editable || busy} /></label>
         {message ? <p className="form-message" role="alert">{message}</p> : null}
-        {editable ? <div className="review-actions"><button type="button" className="button secondary" onClick={() => void submit('REJECT')} disabled={busy || !description || !quantity || !unit}>Reject</button><button className="button primary" disabled={busy || !description || !quantity || !unit}>{busy ? 'Saving…' : 'Verify receipt'}</button></div> : null}
+        {editable ? <div className="review-actions"><button type="button" className="button secondary" onClick={() => void submit('REJECT')} disabled={busy || !description || !quantity || !unit}>Reject</button><button className="button primary" disabled={busy || !poNumber || !materialCode || !description || !quantity || !unit}>{busy ? 'Saving…' : 'Verify receipt'}</button></div> : null}
       </form>
     </article>
   );
+}
+
+function DeltaView() {
+  const [rows, setRows] = useState<ReconciliationRow[]>([]);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(true);
+
+  const load = useCallback(async () => {
+    setBusy(true);
+    setMessage('');
+    try { setRows((await listReconciliation()).rows); }
+    catch (caught) { setMessage(caught instanceof Error ? caught.message : 'Reconciliation is unavailable.'); }
+    finally { setBusy(false); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const upload = async (file: File) => {
+    setBusy(true);
+    setMessage('');
+    try {
+      const result = await importPurchaseOrders(await file.text());
+      setMessage(result.duplicate ? 'This purchase-order file was already imported.' : `${result.row_count} purchase-order rows imported.`);
+      await load();
+    } catch (caught) { setMessage(caught instanceof Error ? caught.message : 'Purchase-order import failed.'); }
+    finally { setBusy(false); }
+  };
+
+  return <section className="delta-view">
+    <div className="delta-actions"><div><h1>Delta view</h1><p>Verified site receipts compared with the latest Tally purchase-order import.</p></div><label className="button primary file-button">Import Tally CSV<input type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); }} /></label></div>
+    {message ? <p className="form-message" role="status">{message}</p> : null}
+    {busy && rows.length === 0 ? <div className="empty">Loading reconciliation…</div> : null}
+    {!busy && rows.length === 0 ? <div className="empty"><strong>No purchase orders imported.</strong><span>Import the approved Tally CSV to begin reconciliation.</span></div> : null}
+    {rows.length ? <div className="table-scroll"><table><thead><tr><th>PO</th><th>Material</th><th>Unit</th><th>PO quantity</th><th>Site received</th><th>Result</th></tr></thead><tbody>{rows.map((row) => <tr className={row.isOver ? 'delta-over' : ''} key={`${row.poNumber}:${row.materialCode}:${row.unit}`}><td>{row.poNumber}</td><td>{row.materialCode}</td><td>{row.unit}</td><td>{row.poQuantity}</td><td>{row.siteReceived}</td><td>{row.isOver ? 'Over PO' : 'Within PO'}</td></tr>)}</tbody></table></div> : null}
+  </section>;
 }
 
 function AdminPanel({ onClose }: { onClose: () => void }) {
@@ -115,6 +157,7 @@ function AdminPanel({ onClose }: { onClose: () => void }) {
 }
 
 export default function App() {
+  const [view, setView] = useState<'INBOX' | 'DELTA'>('INBOX');
   const [status, setStatus] = useState<ReceiptStatus>('NEEDS_REVIEW');
   const [receipts, setReceipts] = useState<ReceiptListItem[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
@@ -138,8 +181,9 @@ export default function App() {
   const title = useMemo(() => filters.find((filter) => filter.value === status)?.label || 'Receipts', [status]);
 
   return <div className="app-shell">
-    <header className="topbar"><a href="https://challanse.constrovet.com" className="brand"><span aria-hidden="true">▦</span>ChallanSe</a><button className="button secondary compact" onClick={() => setAdminOpen(true)}>Site setup</button></header>
+    <header className="topbar"><a href="https://challanse.constrovet.com" className="brand"><span aria-hidden="true">▦</span>ChallanSe</a><nav className="view-switch" aria-label="Reviewer views"><button className={view === 'INBOX' ? 'active' : ''} onClick={() => setView('INBOX')}>Inbox</button><button className={view === 'DELTA' ? 'active' : ''} onClick={() => setView('DELTA')}>Delta</button></nav><button className="button secondary compact" onClick={() => setAdminOpen(true)}>Site setup</button></header>
     <main>
+      {view === 'DELTA' ? <DeltaView /> : <>
       <section className="inbox-header"><div><h1>{title}</h1><p>Review the image, correct the receipt details, and make one clear decision.</p></div><button className="icon-button refresh" onClick={() => void load(false)} aria-label="Refresh inbox">↻</button></section>
       <nav className="filters" aria-label="Receipt status">{filters.map((filter) => <button key={filter.value} className={status === filter.value ? 'active' : ''} onClick={() => setStatus(filter.value)}>{filter.label}</button>)}</nav>
       {message ? <div className="notice error" role="alert">{message}<button onClick={() => void load(false)}>Retry</button></div> : null}
@@ -147,6 +191,7 @@ export default function App() {
       {!busy && receipts.length === 0 && !message ? <div className="empty"><strong>Nothing waiting here.</strong><span>New site receipts will appear automatically.</span></div> : null}
       <div className="receipt-list">{receipts.map((receipt) => <ReceiptCard key={receipt.id} receipt={receipt} onSaved={() => void load(false)} />)}</div>
       {nextCursor ? <button className="button secondary load-more" onClick={() => void load(true)} disabled={busy}>Load more</button> : null}
+      </>}
     </main>
     {adminOpen ? <AdminPanel onClose={() => setAdminOpen(false)} /> : null}
   </div>;

@@ -5,6 +5,11 @@ const target = new URL('../apps/edge/wrangler.generated.toml', import.meta.url);
 const databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID;
 const accessTeamDomain = process.env.CLOUDFLARE_ACCESS_TEAM_DOMAIN;
 const accessAudience = process.env.CLOUDFLARE_ACCESS_AUD;
+const enrichmentUrl = process.env.ENRICHMENT_URL || '';
+const edgeToEnrichmentKeyId = process.env.EDGE_TO_ENRICHMENT_HMAC_KEY_ID || '';
+const edgeToEnrichmentNextKeyId = process.env.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID || '';
+const enrichmentToEdgeKeyId = process.env.ENRICHMENT_TO_EDGE_HMAC_KEY_ID || '';
+const enrichmentToEdgeNextKeyId = process.env.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID || '';
 
 if (!databaseId || !/^[0-9a-f-]{36}$/i.test(databaseId)) {
   throw new Error('CLOUDFLARE_D1_DATABASE_ID must be a D1 database UUID.');
@@ -17,6 +22,12 @@ const config = (await readFile(source, 'utf8'))
   .replace('00000000-0000-0000-0000-000000000000', databaseId)
   .replace('ACCESS_TEAM_DOMAIN = ""', `ACCESS_TEAM_DOMAIN = ${JSON.stringify(accessTeamDomain)}`)
   .replace('ACCESS_AUD = ""', `ACCESS_AUD = ${JSON.stringify(accessAudience)}`);
+const rendered = config
+  .replace('ENRICHMENT_URL = ""', `ENRICHMENT_URL = ${JSON.stringify(enrichmentUrl)}`)
+  .replace('EDGE_TO_ENRICHMENT_HMAC_KEY_ID = ""', `EDGE_TO_ENRICHMENT_HMAC_KEY_ID = ${JSON.stringify(edgeToEnrichmentKeyId)}`)
+  .replace('EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID = ""', `EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID = ${JSON.stringify(edgeToEnrichmentNextKeyId)}`)
+  .replace('ENRICHMENT_TO_EDGE_HMAC_KEY_ID = ""', `ENRICHMENT_TO_EDGE_HMAC_KEY_ID = ${JSON.stringify(enrichmentToEdgeKeyId)}`)
+  .replace('ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID = ""', `ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID = ${JSON.stringify(enrichmentToEdgeNextKeyId)}`);
 
-await writeFile(target, config);
+await writeFile(target, rendered);
 console.log('Generated apps/edge/wrangler.generated.toml');

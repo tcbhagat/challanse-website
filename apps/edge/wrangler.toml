@@ -8,6 +8,11 @@ ALLOWED_ORIGINS = "https://challanse.constrovet.com,https://review.challanse.con
 ACCESS_TEAM_DOMAIN = ""
 ACCESS_AUD = ""
 ENVIRONMENT = "production"
+ENRICHMENT_URL = ""
+EDGE_TO_ENRICHMENT_HMAC_KEY_ID = ""
+EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID = ""
+ENRICHMENT_TO_EDGE_HMAC_KEY_ID = ""
+ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID = ""
 
 [[d1_databases]]
 binding = "DB"

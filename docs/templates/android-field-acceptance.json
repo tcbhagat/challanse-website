@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "android_api_level": 26,
+  "device_ram_mb": 2048,
+  "binary_writes": 0,
+  "minimum_image_bytes": null,
+  "maximum_image_bytes": null,
+  "p95_write_ms": null,
+  "metadata_loss_count": null,
+  "sqlcipher_status_verified": false,
+  "wrong_key_rejected": false,
+  "raw_database_scan_clean": false,
+  "restart_recovery_passed": false,
+  "reboot_sync_passed": false,
+  "interrupted_upload_resume_passed": false
+}

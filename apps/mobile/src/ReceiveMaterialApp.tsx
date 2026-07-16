@@ -89,6 +89,21 @@ function QuantityControl({
   );
 }
 
+function CameraPermissionAction({ onPress }: { onPress: () => void }) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel="Open camera. कैमरा खोलें"
+      onPress={onPress}
+      style={({ pressed }) => [styles.permissionButton, pressed && styles.pressed]}>
+      <View style={styles.permissionCameraBody}>
+        <View style={styles.permissionCameraTop} />
+        <View style={styles.permissionCameraLens} />
+      </View>
+    </Pressable>
+  );
+}
+
 function ReceiveMaterialScreen({ configuration }: { configuration: PilotConfiguration }) {
   const insets = useSafeAreaInsets();
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -203,7 +218,9 @@ function ReceiveMaterialScreen({ configuration }: { configuration: PilotConfigur
             mirrorMode="auto"
           />
         ) : (
-          <View style={styles.cameraFallback} />
+          <View style={styles.cameraFallback}>
+            {!hasPermission && <CameraPermissionAction onPress={() => requestPermission().catch(() => undefined)} />}
+          </View>
         )}
 
         <View style={styles.overlayWash} />
@@ -261,7 +278,41 @@ const styles = StyleSheet.create({
   },
   cameraFallback: {
     ...StyleSheet.absoluteFill,
+    alignItems: 'center',
     backgroundColor: '#000000',
+    justifyContent: 'center',
+  },
+  permissionButton: {
+    alignItems: 'center',
+    backgroundColor: '#F4A300',
+    borderRadius: 48,
+    height: 96,
+    justifyContent: 'center',
+    width: 96,
+  },
+  permissionCameraBody: {
+    alignItems: 'center',
+    backgroundColor: '#071A2E',
+    borderRadius: 8,
+    height: 38,
+    justifyContent: 'center',
+    width: 54,
+  },
+  permissionCameraTop: {
+    backgroundColor: '#071A2E',
+    borderTopLeftRadius: 4,
+    borderTopRightRadius: 4,
+    height: 8,
+    position: 'absolute',
+    top: -7,
+    width: 24,
+  },
+  permissionCameraLens: {
+    borderColor: '#F4A300',
+    borderRadius: 11,
+    borderWidth: 4,
+    height: 22,
+    width: 22,
   },
   overlayWash: {
     ...StyleSheet.absoluteFill,

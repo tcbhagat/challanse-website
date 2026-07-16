@@ -1,43 +1,60 @@
-# Hybrid enrichment activation
+# Hybrid enrichment operations
 
-## Safe default
+## Authority and boundaries
 
-The Cloudflare Worker can operate with no enrichment configuration. It records `ENRICHMENT_DISABLED` and continues the manual reviewer workflow. The FastAPI service accepts signed events only when `CLOUDFLARE_SHARED_SECRET` is configured and acknowledges them only after the configured event queue accepts the task.
+- Cloudflare D1 is the authoritative mobile-ingestion ledger; private original WebP images remain in R2.
+- AWS Mumbai (`ap-south-1`) runs FastAPI, SQS workers, encrypted PostgreSQL, reconciliation, digest generation, and telemetry reports.
+- PostgreSQL is authoritative for enrichment and reconciliation state. Signed callbacks expose only the reviewer projection in D1.
+- Manual review and Tally CSV reconciliation are active. OCR, GST, WhatsApp, Slack, and credit providers default to `disabled` and must not be marketed as active.
+- Cloudflare storage is globally distributed. The system does not claim India-only data residency.
 
-All external providers default to `disabled`:
+## Request security
 
-| Variable | Allowed values | Production default |
+Every Cloudflare-to-AWS and AWS-to-Cloudflare request includes:
+
+- `X-ChallanSe-Key-Id`
+- `X-ChallanSe-Timestamp`
+- `X-ChallanSe-Request-Id`
+- `X-ChallanSe-Content-SHA256`
+- `X-ChallanSe-Signature`
+
+The canonical value is the newline-joined timestamp, request ID, key ID, uppercase method, path, and body SHA-256. Receivers reject invalid digests, signatures, timestamps older than 60 seconds, unknown key IDs, and replayed request IDs. Cloudflare Access service credentials are required in addition to HMAC.
+
+Each direction has active and next keys. Rotation is two-phase:
+
+```bash
+./scripts/go-live.sh rotate-enrichment-keys stage
+# Deploy and verify both sides accept the staged next keys.
+./scripts/go-live.sh rotate-enrichment-keys promote
+# Deploy and verify again. The prior active key remains the overlap key.
+```
+
+Never skip the deployment and verification between phases.
+
+## Durable processing
+
+`POST /v1/events/receipts` validates authentication, reserves the request ID and receipt UUID in PostgreSQL, and returns `202` only after SQS accepts the event. Duplicate requests return the existing ingress result. The SQS worker uses long polling, extends visibility while processing, and deletes a message only after the PostgreSQL transaction and Cloudflare callback succeed. Stage uniqueness and a transactional outbox make duplicate SQS delivery safe.
+
+The worker fetches the private image through the signed Cloudflare endpoint, verifies size and SHA-256, confirms WebP content, converts it to PNG in memory, and then invokes the selected OCR adapter. Confidence below 60 percent or provider failure becomes `NEEDS_HUMAN_REVIEW`.
+
+## Provider activation
+
+| Provider | Production default | Activation gate |
 | --- | --- | --- |
-| `EVENT_QUEUE_PROVIDER` | `disabled`, `memory`, `celery` | `disabled` |
-| `OCR_PROVIDER` | `disabled`, `mock`, `textract` | `disabled` |
-| `GST_PROVIDER` | `disabled`, `mock`, `http` | `disabled` |
-| `NOTIFICATION_PROVIDER` | `disabled`, `mock`, `whatsapp` | `disabled` |
-| `CREDIT_PROVIDER` | `disabled`, `mock`, `sqs` | `disabled` |
-| `SLACK_PROVIDER` | `disabled`, `mock`, `webhook` | `disabled` |
+| Textract | `disabled` | Approved AWS permissions, cost budget, redaction review, timeout and low-confidence tests |
+| GST | `disabled` | Legal approval, real endpoint credentials, 3-second timeout tests, encrypted statutory fields |
+| Credit queue | `disabled` | GST verified, banking/legal approval, exact `AA_1.0.0` contract acceptance |
+| WhatsApp | `disabled` | Business account and approved four-hour digest template |
+| Slack | `disabled` | Approved webhook and redaction review |
 
-`memory` and `mock` are test-only and must never be used for real receipts.
+Mock providers are forbidden when `ENVIRONMENT=production`. GST mismatch or failure never emits a credit message.
 
-## Service contract
+## Failure recovery
 
-Cloudflare signs each event with HMAC-SHA256 over `timestamp.request-id.body`. The service rejects missing, invalid, or older-than-60-second signatures. Cloudflare callbacks use the same contract and persist each request ID in D1 to prevent replay.
+- SQS moves a message to the DLQ after five receives; messages are retained for 14 days.
+- Replay is guarded and rate-limited to one message per second: `./scripts/go-live.sh replay-dlq`.
+- ECS uses deployment circuit breakers and automatic rollback.
+- Production RDS is Multi-AZ with seven-day automated backups and deletion protection. Restore evidence is required before release.
+- Ninety-day image and one-year receipt/audit retention use tombstones across D1, R2, and PostgreSQL.
 
-The worker fetches an image through the private internal Cloudflare endpoint, extracts available EXIF GPS, runs the configured OCR adapter, persists PostgreSQL evidence, and sends a signed projection callback. OCR confidence below 60 percent becomes `NEEDS_HUMAN_REVIEW`.
-
-## Staging acceptance
-
-1. Apply `services/enrichment/migrations/0001_enrichment.sql` to an isolated PostgreSQL database.
-2. Configure Redis and set `EVENT_QUEUE_PROVIDER=celery`.
-3. Use `OCR_PROVIDER=mock`; leave GST, notifications, credit, and Slack disabled.
-4. Configure the same 32-byte random `CLOUDFLARE_SHARED_SECRET` in the service and Cloudflare Worker secret `ENRICHMENT_SHARED_SECRET`.
-5. Set the Worker variable `ENRICHMENT_URL` to the private staging service URL.
-6. Start the worker with `celery -A app.tasks.celery_app worker -Q challanse-enrichment`.
-7. Process synthetic receipts and confirm private image authorization, PostgreSQL idempotency, callback replay rejection, and reviewer OCR evidence.
-8. Do not enable real external providers until their dedicated legal, credential, redaction, timeout, circuit-breaker, and dead-letter acceptance checks pass.
-
-## Known launch gates
-
-- Rotate the exposed pre-release Android signing identity.
-- Run an Android native build with a configured SDK and confirm the Gradle output includes `[OP-SQLITE] using sqlcipher.`
-- Run the 100-write instrumentation test on Android 8 with a 2 GB device profile; JavaScript mock timing is not field evidence.
-- Complete a two-device, 20-receipt offline/reboot/resume trial before the five-device pilot.
-- Keep `PILOT_DEPLOY_ENABLED=false` until these gates are recorded in the release manifest.
+See `docs/aws-bootstrap.md` for account provisioning and `docs/pilot-runbook.md` for release acceptance.

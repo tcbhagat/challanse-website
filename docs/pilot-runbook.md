@@ -1,47 +1,50 @@
 # Controlled pilot runbook
 
-## Scope
+## Approved scope
 
-- One approved construction site.
-- Maximum five enrolled Android devices.
-- Two approved controller reviewers.
-- Maximum 50 receipts per UTC day and 750 KB per synchronized image.
-- Manual reviewer verification is authoritative.
+- One construction site, no more than five enrolled Android devices and two reviewers.
+- Approximately 50 receipts per day; synchronized images target 750 KB.
+- Directly signed APK distribution; manual controller verification is authoritative.
+- No formal SLA. Pilot recovery target is one business day with no more than 24 hours of data loss.
 
-## Readiness
+## Release gates
 
-0. Run `./scripts/go-live.sh preflight`, `provision`, `configure-github`, and `deploy` in order; never bypass a failed guard.
-1. Confirm production `/health` and `/ready` responses.
-2. Confirm Cloudflare Access denies an unapproved email and permits both reviewers.
-3. Seed only owner-approved vendors and Wi-Fi SSIDs.
-4. Enroll two devices using separate single-use QR codes; prove expiry, reuse rejection, and revocation.
-5. Confirm each device shows the correct site and vendor choices while offline.
-6. Run `./scripts/go-live.sh verify` after the first real receipt reaches the reviewer inbox.
+1. Rotate the exposed Android signing identity with `rotate-signing`; verify the active and revoked fingerprints differ and preserve the encrypted offline backup separately.
+2. Provision separate staging and production AWS accounts using `docs/aws-bootstrap.md`.
+3. Run all required CI checks: `validate`, `android`, `enrichment`, `security`, `integration`, and `terraform-plan`.
+4. Deploy staging with providers disabled and process at least 20 synthetic receipts with no loss or duplication.
+5. Record the reviewed staging report using `accept-staging`.
+6. On Android 8/API 26 with no more than 2 GB RAM, run 100 real binary writes from 500 KB to 5 MB; require p95 below 50 ms, encryption proof, restart/reboot recovery, and no metadata loss.
+7. Record the field report using `accept-android-field`.
+8. Run `harden-github`; keep `PILOT_DEPLOY_ENABLED=false` until the guarded deployment begins.
+9. Deploy only after typing `DEPLOY <commit-sha>` and verify the release manifest against the APK.
+
+Templates are in `docs/templates/`. Acceptance hashes prove which reviewed files were approved; keep the original reports in the controlled release evidence store.
 
 ## Field acceptance
 
-1. Capture 100 receipts on an Android 8 / 2 GB profile and record p95 local database write time; acceptance requires below 50 ms and no metadata loss.
-2. Complete a 20-receipt offline trial, restart the app, then reconnect while charging on permitted Wi-Fi.
-3. Confirm each receipt appears exactly once and its SHA-256 checksum matches the private image.
-4. Verify Site A cannot list or stream Site B data.
-5. Verify concurrent reviewer edits return `409` and do not overwrite accepted data.
-6. Confirm reviewer records challan number, material, quantity, unit, notes, identity, time, and immutable audit event.
+1. Seed only owner-approved site, Wi-Fi, reviewer, and vendor data.
+2. Enroll two devices using separate single-use 10-minute QR codes. Prove expiry, reuse rejection, device cap, and revocation.
+3. Capture 20 receipts offline, restart one app, reboot one device, reconnect while charging on approved Wi-Fi, and confirm exactly-once cloud records.
+4. Verify image checksum, private streaming, cross-site denial, replay denial, and concurrent reviewer `409` behavior.
+5. Import a synthetic then approved Tally CSV; verify duplicate detection, unit handling, and red `Site Received > PO Quantity` rows.
+6. Confirm provider status visibly remains disabled for OCR, GST, WhatsApp, Slack, and credit unless separate approval evidence exists.
 
 ## Operations
 
-- At 70% storage allowance, the admin summary warns the controller.
-- At 90%, cloud uploads pause; devices retain their local queue.
-- Acknowledged device images remain for seven days before local removal.
-- R2 images are deleted after 90 days; remaining receipt and audit data after one year.
-- The scheduled reconciliation job recovers durable `RECEIVED` rows if queue delivery expires.
-- Logs must never contain images, credentials, challan text, or personal contact fields.
+- Devices never delete unsynced data. Acknowledged local images have a seven-day grace period.
+- At 70% of the pilot allowance, warn administrators; at 90%, pause uploads while preserving local queues.
+- R2 images are deleted after 90 days and remaining receipt/audit data after one year through tombstone workflows.
+- Generate four-hour digest records without individual notifications. Delivery remains disabled until approved.
+- Generate nightly friction reports for write latency above 100 ms, site sync failure above 20%, and vendor OCR confidence below 70%.
+- Never log images, OCR text, credentials, GST/IRN/Udyam/bank values, or personal contacts.
 
 ## Incident response
 
-Revoke a lost device immediately, preserve its unsynced local data if recoverable, and rotate the device-token pepper only as a coordinated re-enrollment event. Disable pilot deployment or uploads when authorization, data isolation, checksum validation, or retention controls fail.
+1. Run `./scripts/rollback-production.sh` to disable deployment while preserving D1, R2, PostgreSQL, SQS, and device queues.
+2. Add `--revoke-devices` only for credential compromise; this requires re-enrollment.
+3. Replay DLQ messages only after the root cause is fixed and the exact queue ARN is confirmed.
+4. Restore RDS to an isolated instance before any destructive production recovery.
+5. Record incident timeline, affected receipt UUIDs, recovery evidence, and residual risk without copying receipt contents into logs.
 
-`./scripts/rollback-production.sh` disables deployment without deleting cloud or device data. Add `--revoke-devices` only when all enrolled credentials must be invalidated.
-
-## Pilot limits
-
-Cloudflare and GitHub free tiers provide no uptime SLA or independent off-provider backup. Do not expand beyond the controlled scope until field acceptance, retention verification, and an approved paid resilience plan exist.
+Losing the direct-distribution signing key prevents seamless APK updates. Maintain one verified encrypted offline backup and store its password separately.

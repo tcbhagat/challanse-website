@@ -17,8 +17,8 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
@@ -32,7 +32,7 @@ jobs:
       - name: Run landing Lighthouse gate
         run: |
           python3 -m http.server 4173 --directory dist/landing > /tmp/challanse-http.log 2>&1 &
-          for attempt in {1..20}; do
+          for _ in {1..20}; do
             curl --fail --silent http://127.0.0.1:4173/ > /dev/null && break
             sleep 1
           done
@@ -41,12 +41,12 @@ jobs:
   android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
         with:
           distribution: temurin
           java-version: 17
@@ -62,20 +62,169 @@ jobs:
       run:
         working-directory: services/enrichment
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: services/enrichment/requirements.txt
-      - run: python -m pip install --requirement requirements.txt
+          cache-dependency-path: services/enrichment/requirements-dev.txt
+      - run: python -m pip install --requirement requirements-dev.txt
       - run: python -m pytest -q
       - name: Validate PostgreSQL migrations
-        run: test -s migrations/0001_enrichment.sql && grep -q 'immutable_enrichment_audits' migrations/0001_enrichment.sql
+        run: test -s migrations/0001_enrichment.sql && test -s migrations/0002_release_hardening.sql && test -s migrations/0003_operational_jobs.sql && test -s migrations/0004_replay_protection.sql && grep -q 'transactional_outbox' migrations/0002_release_hardening.sql
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+      - run: python -m pip install --requirement services/enrichment/requirements-security.txt
+      - run: python -m pip_audit --requirement services/enrichment/requirements.txt
+      - run: bandit -q -r services/enrichment/app
+      - run: bash scripts/test-production-config.sh
+      - name: Scan Terraform configuration
+        run: docker run --rm -v "$PWD:/src" aquasec/trivy@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e config --skip-version-check --exit-code 1 --severity HIGH,CRITICAL /src/infra
+
+  terraform-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.9.8
+      - run: terraform fmt -check -recursive infra/terraform
+      - run: terraform -chdir=infra/terraform/staging init -backend=false
+      - run: terraform -chdir=infra/terraform/staging validate
+      - run: terraform -chdir=infra/terraform/production init -backend=false
+      - run: terraform -chdir=infra/terraform/production validate
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.5
+        env:
+          POSTGRES_DB: challanse_test
+          POSTGRES_USER: challanse
+          POSTGRES_PASSWORD: challanse-test-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U challanse -d challanse_test"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      localstack:
+        image: localstack/localstack:4.6.0
+        env:
+          SERVICES: sqs,kms,textract
+        ports: ['4566:4566']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: services/enrichment/requirements-dev.txt
+      - run: python -m pip install --requirement services/enrichment/requirements-dev.txt
+      - run: PYTHONPATH=services/enrichment python -m pytest -q services/enrichment/tests -m integration
+        env:
+          TEST_DATABASE_URL: postgresql://challanse:challanse-test-only@127.0.0.1:5432/challanse_test
+          AWS_ENDPOINT_URL: http://127.0.0.1:4566
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: ap-south-1
+
+  deploy-enrichment:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true' && vars.AWS_ENRICHMENT_BOOTSTRAPPED == 'true'
+    needs: [validate, android, enrichment, security, integration, terraform-plan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: production
+    outputs:
+      image_uri: ${{ steps.image.outputs.uri }}
+      migration: 0004_replay_protection.sql
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_PRODUCTION_TERRAFORM_ROLE_ARN }}
+          aws-region: ap-south-1
+      - uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: 1.9.8
+      - name: Build and push immutable enrichment image
+        id: image
+        run: |
+          image="${AWS_ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker build --pull --tag "$image" services/enrichment
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy@sha256:a8ca29078522f30393bdb34225e4c0994d38f37083be81a42da3a2a7e1488e9e image --skip-version-check --scanners vuln --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL "$image"
+          docker push "$image"
+          digest="$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$GITHUB_SHA" --query 'imageDetails[0].imageDigest' --output text)"
+          test "$digest" != "None"
+          echo "uri=${AWS_ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/${ECR_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+        env:
+          AWS_ACCOUNT_ID: ${{ vars.AWS_PRODUCTION_ACCOUNT_ID }}
+          ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+      - name: Initialize production Terraform
+        run: >-
+          terraform -chdir=infra/terraform/production init
+          -backend-config="bucket=${{ vars.AWS_TERRAFORM_STATE_BUCKET }}"
+          -backend-config="region=ap-south-1"
+          -backend-config="kms_key_id=${{ vars.AWS_TERRAFORM_STATE_KMS_KEY_ARN }}"
+          -backend-config="use_lockfile=true"
+      - name: Apply infrastructure with services stopped
+        run: >-
+          terraform -chdir=infra/terraform/production apply -auto-approve
+          -var="container_image=${{ steps.image.outputs.uri }}"
+          -var="adot_collector_image=${{ vars.AWS_ADOT_COLLECTOR_IMAGE }}"
+          -var="certificate_arn=${{ vars.AWS_ENRICHMENT_CERTIFICATE_ARN }}"
+          -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
+          -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
+          -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
+          -var="services_enabled=false"
+      - name: Apply PostgreSQL migrations as one-off task
+        run: |
+          cluster="$(terraform -chdir=infra/terraform/production output -raw ecs_cluster_name)"
+          task_definition="$(terraform -chdir=infra/terraform/production output -raw api_task_definition_arn)"
+          subnets="$(terraform -chdir=infra/terraform/production output -json private_subnet_ids | jq -r 'join(",")')"
+          security_group="$(terraform -chdir=infra/terraform/production output -raw service_security_group_id)"
+          task_arn="$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --overrides '{"containerOverrides":[{"name":"api","command":["python","-m","app.migrate"]}]}' --query 'tasks[0].taskArn' --output text)"
+          test "$task_arn" != "None"
+          aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn"
+          exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" --query 'tasks[0].containers[0].exitCode' --output text)"
+          test "$exit_code" = "0"
+      - name: Enable API and worker after migrations
+        run: >-
+          terraform -chdir=infra/terraform/production apply -auto-approve
+          -var="container_image=${{ steps.image.outputs.uri }}"
+          -var="adot_collector_image=${{ vars.AWS_ADOT_COLLECTOR_IMAGE }}"
+          -var="certificate_arn=${{ vars.AWS_ENRICHMENT_CERTIFICATE_ARN }}"
+          -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
+          -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
+          -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
+          -var="services_enabled=true"
+      - name: Record enrichment deployment evidence
+        run: |
+          jq -n --arg commit "$GITHUB_SHA" --arg image "${{ steps.image.outputs.uri }}" --arg region "ap-south-1" --arg migration "0004_replay_protection.sql" '{commit_sha:$commit,image:$image,region:$region,migration:$migration,providers:{ocr:"disabled",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > enrichment-deployment.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: challanse-enrichment-deployment
+          path: enrichment-deployment.json
+          if-no-files-found: error
 
   deploy-landing:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true'
-    needs: [validate, android, enrichment]
+    needs: [validate, android, enrichment, security, integration, terraform-plan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,8 +234,8 @@ jobs:
       name: production
       url: https://challanse.constrovet.com
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
@@ -96,22 +245,25 @@ jobs:
           CHALLANSE_API_BASE_URL: https://api.challanse.constrovet.com
           TURNSTILE_SITE_KEY: ${{ vars.TURNSTILE_SITE_KEY }}
           CHALLANSE_CUSTOM_DOMAIN: challanse.constrovet.com
-      - uses: actions/configure-pages@v6
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: dist/landing
       - id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
 
   deploy-cloudflare:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true'
-    needs: [validate, android, enrichment]
+    needs: [validate, android, enrichment, security, integration, terraform-plan, deploy-enrichment]
     runs-on: ubuntu-latest
     environment:
       name: production
+    outputs:
+      api_worker_version: ${{ steps.worker_versions.outputs.api }}
+      reviewer_worker_version: ${{ steps.worker_versions.outputs.reviewer }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
@@ -121,6 +273,11 @@ jobs:
           CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
           CLOUDFLARE_ACCESS_TEAM_DOMAIN: ${{ vars.CLOUDFLARE_ACCESS_TEAM_DOMAIN }}
           CLOUDFLARE_ACCESS_AUD: ${{ vars.CLOUDFLARE_ACCESS_AUD }}
+          ENRICHMENT_URL: ${{ vars.ENRICHMENT_URL }}
+          EDGE_TO_ENRICHMENT_HMAC_KEY_ID: ${{ vars.EDGE_TO_ENRICHMENT_HMAC_KEY_ID }}
+          EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID: ${{ vars.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID }}
+          ENRICHMENT_TO_EDGE_HMAC_KEY_ID: ${{ vars.ENRICHMENT_TO_EDGE_HMAC_KEY_ID }}
+          ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID: ${{ vars.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID }}
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply challanse-pilot --remote --config apps/edge/wrangler.generated.toml
         env:
@@ -130,11 +287,23 @@ jobs:
         run: |
           printf '%s' "$DEVICE_TOKEN_PEPPER" | npx wrangler secret put DEVICE_TOKEN_PEPPER --config apps/edge/wrangler.generated.toml
           printf '%s' "$TURNSTILE_SECRET" | npx wrangler secret put TURNSTILE_SECRET --config apps/edge/wrangler.generated.toml
+          printf '%s' "$EDGE_TO_ENRICHMENT_HMAC_KEY" | npx wrangler secret put EDGE_TO_ENRICHMENT_HMAC_KEY --config apps/edge/wrangler.generated.toml
+          printf '%s' "$EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY" | npx wrangler secret put EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY --config apps/edge/wrangler.generated.toml
+          printf '%s' "$ENRICHMENT_TO_EDGE_HMAC_KEY" | npx wrangler secret put ENRICHMENT_TO_EDGE_HMAC_KEY --config apps/edge/wrangler.generated.toml
+          printf '%s' "$ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY" | npx wrangler secret put ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY --config apps/edge/wrangler.generated.toml
+          printf '%s' "$ENRICHMENT_ACCESS_CLIENT_ID" | npx wrangler secret put ENRICHMENT_ACCESS_CLIENT_ID --config apps/edge/wrangler.generated.toml
+          printf '%s' "$ENRICHMENT_ACCESS_CLIENT_SECRET" | npx wrangler secret put ENRICHMENT_ACCESS_CLIENT_SECRET --config apps/edge/wrangler.generated.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           DEVICE_TOKEN_PEPPER: ${{ secrets.DEVICE_TOKEN_PEPPER }}
           TURNSTILE_SECRET: ${{ secrets.TURNSTILE_SECRET }}
+          EDGE_TO_ENRICHMENT_HMAC_KEY: ${{ secrets.EDGE_TO_ENRICHMENT_HMAC_KEY }}
+          EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY: ${{ secrets.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY }}
+          ENRICHMENT_TO_EDGE_HMAC_KEY: ${{ secrets.ENRICHMENT_TO_EDGE_HMAC_KEY }}
+          ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY: ${{ secrets.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY }}
+          ENRICHMENT_ACCESS_CLIENT_ID: ${{ secrets.ENRICHMENT_ACCESS_CLIENT_ID }}
+          ENRICHMENT_ACCESS_CLIENT_SECRET: ${{ secrets.ENRICHMENT_ACCESS_CLIENT_SECRET }}
       - name: Deploy API
         run: npx wrangler deploy --config apps/edge/wrangler.generated.toml
         env:
@@ -150,25 +319,44 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - name: Record deployed Worker versions
+        id: worker_versions
+        run: |
+          api="$(curl --fail --silent --show-error -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/challanse-api/versions" | jq -er '.result[0].id')"
+          reviewer="$(curl --fail --silent --show-error -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/challanse-reviewer/versions" | jq -er '.result[0].id')"
+          echo "api=$api" >> "$GITHUB_OUTPUT"
+          echo "reviewer=$reviewer" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   release-android:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true'
-    needs: [validate, android, enrichment]
+    needs: [validate, android, enrichment, security, integration, terraform-plan, deploy-enrichment, deploy-cloudflare, deploy-landing]
     runs-on: ubuntu-latest
     environment:
       name: production
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           cache: npm
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
         with:
           distribution: temurin
           java-version: 17
           cache: gradle
       - run: npm ci
+      - name: Require production HTTPS and fail-closed provider state
+        run: |
+          test "$(curl --fail --silent --show-error -o /dev/null -w '%{http_code}' https://challanse.constrovet.com/)" = "200"
+          health="$(curl --fail --silent --show-error https://api.challanse.constrovet.com/health)"
+          ready="$(curl --fail --silent --show-error https://api.challanse.constrovet.com/ready)"
+          jq -e '.status == "ok"' >/dev/null <<<"$health"
+          jq -e '.status == "ready"' >/dev/null <<<"$ready"
+          reviewer="$(curl --silent --show-error -o /dev/null -w '%{http_code}' https://review.challanse.constrovet.com/)"
+          [[ "$reviewer" == "302" || "$reviewer" == "403" ]]
       - name: Restore release keystore
         run: echo "$CHALLANSE_KEYSTORE_BASE64" | base64 --decode > apps/mobile/android/challanse-release.jks
         env:
@@ -185,17 +373,27 @@ jobs:
           test "$fingerprint" = "$EXPECTED_FINGERPRINT"
           test -z "$REVOKED_FINGERPRINT" || test "$fingerprint" != "$REVOKED_FINGERPRINT"
           apk_sha256="$(sha256sum apps/mobile/android/app/build/outputs/apk/release/app-release.apk | awk '{print $1}')"
-          jq -n --arg commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg apk_sha256 "$apk_sha256" --arg signing_cert_sha256 "$fingerprint" \
-            '{schema_version:"1.0",commit_sha:$commit,workflow_run_id:$run_id,apk_sha256:$apk_sha256,signing_certificate_sha256:$signing_cert_sha256}' > release-manifest.json
+          jq -n --arg commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg apk_sha256 "$apk_sha256" \
+            --arg signing_cert_sha256 "$fingerprint" --arg revoked_signing_cert_sha256 "$REVOKED_FINGERPRINT" \
+            --arg enrichment_image "$ENRICHMENT_IMAGE" --arg migration "$MIGRATION" \
+            --arg api_worker_version "$API_WORKER_VERSION" --arg reviewer_worker_version "$REVIEWER_WORKER_VERSION" \
+            --arg staging_acceptance_sha256 "$STAGING_ACCEPTANCE_SHA256" --arg android_field_acceptance_sha256 "$ANDROID_FIELD_ACCEPTANCE_SHA256" \
+            '{schema_version:"1.2",commit_sha:$commit,workflow_run_id:$run_id,apk_sha256:$apk_sha256,signing_certificate_sha256:$signing_cert_sha256,revoked_signing_certificate_sha256:$revoked_signing_cert_sha256,enrichment:{image:$enrichment_image,migration:$migration,region:"ap-south-1"},cloudflare:{api_worker_version:$api_worker_version,reviewer_worker_version:$reviewer_worker_version},acceptance:{staging_sha256:$staging_acceptance_sha256,android_field_sha256:$android_field_acceptance_sha256},verification:{https:true,health:true,readiness:true,access_gate:true},external_providers:{ocr:"disabled",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > release-manifest.json
         env:
           EXPECTED_FINGERPRINT: ${{ vars.CHALLANSE_SIGNING_CERT_SHA256 }}
           REVOKED_FINGERPRINT: ${{ vars.CHALLANSE_REVOKED_SIGNING_CERT_SHA256 }}
-      - uses: actions/upload-artifact@v7
+          ENRICHMENT_IMAGE: ${{ needs.deploy-enrichment.outputs.image_uri }}
+          MIGRATION: ${{ needs.deploy-enrichment.outputs.migration }}
+          API_WORKER_VERSION: ${{ needs.deploy-cloudflare.outputs.api_worker_version }}
+          REVIEWER_WORKER_VERSION: ${{ needs.deploy-cloudflare.outputs.reviewer_worker_version }}
+          STAGING_ACCEPTANCE_SHA256: ${{ vars.STAGING_ACCEPTANCE_SHA256 }}
+          ANDROID_FIELD_ACCEPTANCE_SHA256: ${{ vars.ANDROID_FIELD_ACCEPTANCE_SHA256 }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: challanse-android-release
           path: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: challanse-release-manifest
           path: release-manifest.json

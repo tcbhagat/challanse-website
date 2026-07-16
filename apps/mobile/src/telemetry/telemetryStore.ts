@@ -11,8 +11,9 @@ export type TelemetryEventInput = {
   createdAtUnix?: number;
 };
 
-export type TelemetryEventRecord = TelemetryEventInput & {
+export type TelemetryEventRecord = Omit<TelemetryEventInput, 'createdAtUnix'> & {
   id: number;
+  createdAtUnix: number;
   sentAtUnix: number | null;
 };
 

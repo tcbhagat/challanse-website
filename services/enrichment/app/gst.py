@@ -20,7 +20,7 @@ def build_aafi(context: GstReceiptContext, result: GstResult) -> AAFIData:
     return AAFIData(
         msme_udyam_number=context.msme_udyam_number,
         recipient_bank_account=context.recipient_bank_account,
-        developer_gst_number=context.vendor_gst_number or "",
+        developer_gst_number=context.developer_gst_number or "",
         irn_hash=result.irn_hash,
         material_description=context.material_description,
         verified_quantity=result.e_invoice_quantity,
@@ -36,7 +36,7 @@ def validate_gst(
     credit_queue: CreditQueue,
     client: httpx.Client | None = None,
 ) -> tuple[str, dict[str, object]]:
-    if not context.vendor_gst_number or context.site_captured_quantity is None:
+    if not context.vendor_gst_number or not context.developer_gst_number or context.site_captured_quantity is None:
         return "NEEDS_HUMAN_REVIEW", {}
     try:
         result = fetch_gst(settings, context.vendor_gst_number, context.timestamp_unix, client)

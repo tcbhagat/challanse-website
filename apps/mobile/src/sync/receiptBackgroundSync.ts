@@ -24,6 +24,7 @@ import {
 } from './receiptSyncStore';
 import { compressReceiptBlobToWebp } from './receiptWebp';
 import { getEnrollmentCredential } from '../config/deviceEnrollment';
+import { listPendingTelemetryEvents, markTelemetryEventsSent, recordTelemetryEvent } from '../telemetry/telemetryStore';
 
 type ReceiptSyncRuntimeGate = { allowed: boolean; reason: string; retryAfterMs: number };
 type ReceiptSyncParameters = { ingestBaseUrl?: string; wifiSsids?: string[]; siteId?: string };
@@ -150,6 +151,35 @@ async function syncReceipt(item: ReceiptSyncQueueItem, apiBaseUrl: string, token
   await completeReceiptSync({ receiptEventId: item.receiptEventId, uploadedBytes: artifact.bytes.byteLength, totalBytes: artifact.bytes.byteLength });
   await clearReceiptUploadId(item.receiptEventId);
   await recordReceiptSyncLog({ receiptEventId: item.receiptEventId, state: 'synced', detail: 'Receipt safely acknowledged by ChallanSe.' });
+  await recordTelemetryEvent({ eventName: 'sync_failure_rate', siteId: item.siteId, vendorId: item.vendorId, value: 0, success: true });
+}
+
+async function syncTelemetry(apiBaseUrl: string, token: string): Promise<void> {
+  const events = await listPendingTelemetryEvents(100);
+  if (!events.length) return;
+  const measurements = events.map((event) => {
+    const created = new Date(event.createdAtUnix * 1000).toISOString();
+    return {
+      source_event_id: String(event.id),
+      vendor_id: event.vendorId ?? null,
+      metric_name: event.eventName,
+      metric_value: event.eventName === 'frontend_write_duration_ms' ? event.durationMs ?? 0 : event.value ?? (event.success ? 0 : 1),
+      sample_count: 1,
+      period_start: created,
+      period_end: created,
+    };
+  }).filter((measurement) => measurement.metric_name === 'frontend_write_duration_ms' || measurement.metric_name === 'sync_failure_rate');
+  if (!measurements.length) {
+    await markTelemetryEventsSent(events.map((event) => event.id));
+    return;
+  }
+  const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/v1/mobile/telemetry`, {
+    method: 'POST',
+    headers: { Accept: 'application/json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ measurements }),
+  });
+  if (!response.ok) throw new Error(`TELEMETRY_HTTP_${response.status}`);
+  await markTelemetryEventsSent(events.map((event) => event.id));
 }
 
 async function run(parameters?: ReceiptSyncParameters): Promise<void> {
@@ -164,6 +194,7 @@ async function run(parameters?: ReceiptSyncParameters): Promise<void> {
     const credential = await getEnrollmentCredential();
     if (!credential) { await sleep(CONSTRAINT_POLL_MS); continue; }
     await purgeAcknowledgedReceiptPayloads(7);
+    try { await syncTelemetry(credential.apiBaseUrl, credential.deviceToken); } catch { /* telemetry remains queued */ }
     const items = await listPendingReceiptSyncItems(MAX_ITEMS_PER_WAKE);
     if (!items.length) { await sleep(IDLE_POLL_MS); continue; }
     for (const item of items) {
@@ -180,6 +211,7 @@ async function run(parameters?: ReceiptSyncParameters): Promise<void> {
           nextAttemptAtUnix: nowUnix() + Math.floor(backoff(item.attemptCount) / 1000),
         });
         await recordReceiptSyncLog({ receiptEventId: item.receiptEventId, state: 'backoff', detail: `Attempt ${attempt}: ${detail}` });
+        await recordTelemetryEvent({ eventName: 'sync_failure_rate', siteId: item.siteId, vendorId: item.vendorId, value: 1, success: false });
       }
     }
   }

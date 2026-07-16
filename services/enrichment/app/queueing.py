@@ -1,7 +1,8 @@
+import json
 from functools import lru_cache
 from typing import Protocol
 
-from celery import Celery
+import boto3
 
 from .config import get_settings
 from .schemas import ReceiptEvent
@@ -25,17 +26,27 @@ class MemoryEventQueue:
         return event.receipt_id
 
 
-class CeleryEventQueue:
-    def __init__(self, broker_url: str) -> None:
-        self.client = Celery("challanse-enrichment-client", broker=broker_url)
+class SqsEventQueue:
+    def __init__(self, queue_url: str, region: str, client=None) -> None:
+        if not queue_url:
+            raise RuntimeError("receipt_queue_url_unconfigured")
+        self.queue_url = queue_url
+        self.client = client or boto3.client("sqs", region_name=region)
 
     def enqueue(self, event: ReceiptEvent) -> str:
-        result = self.client.send_task(
-            "challanse.process_receipt",
-            kwargs={"event_payload": event.model_dump(mode="json")},
-            task_id=f"receipt-{event.receipt_id}",
+        response = self.client.send_message(
+            QueueUrl=self.queue_url,
+            MessageBody=json.dumps(event.model_dump(mode="json"), separators=(",", ":")),
+            MessageAttributes={
+                "schema_version": {"DataType": "String", "StringValue": event.schema_version},
+                "receipt_id": {"DataType": "String", "StringValue": event.receipt_id},
+                "site_id": {"DataType": "String", "StringValue": event.site_id},
+            },
         )
-        return str(result.id)
+        message_id = response.get("MessageId")
+        if not message_id:
+            raise RuntimeError("sqs_message_id_missing")
+        return str(message_id)
 
 
 @lru_cache(maxsize=1)
@@ -43,6 +54,6 @@ def get_event_queue() -> EventQueue:
     settings = get_settings()
     if settings.event_queue_provider == "memory":
         return MemoryEventQueue()
-    if settings.event_queue_provider == "celery":
-        return CeleryEventQueue(settings.redis_url)
+    if settings.event_queue_provider == "sqs":
+        return SqsEventQueue(settings.receipt_queue_url, settings.aws_region)
     return DisabledEventQueue()

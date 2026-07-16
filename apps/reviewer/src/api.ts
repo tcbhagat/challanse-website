@@ -1,4 +1,4 @@
-import type { ReceiptListItem, ReceiptReview } from '@challanse/contracts';
+import type { ReceiptListItem, ReceiptReview, ReconciliationRow } from '@challanse/contracts';
 
 const configuredBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const configuredPublicApi = import.meta.env.VITE_PUBLIC_API_URL as string | undefined;
@@ -57,4 +57,15 @@ export function getAdminSummary() {
 
 export function revokeDevice(deviceId: string) {
   return api<void>(`/v1/admin/devices/${deviceId}`, { method: 'DELETE' });
+}
+
+export function importPurchaseOrders(csvContent: string) {
+  return api<{ import_id: string; duplicate: boolean; row_count: number }>('/v1/reviewer/po-imports', {
+    method: 'POST',
+    body: JSON.stringify({ csvContent }),
+  });
+}
+
+export function listReconciliation() {
+  return api<{ rows: ReconciliationRow[] }>('/v1/reviewer/reconciliation');
 }

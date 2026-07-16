@@ -1,0 +1,11 @@
+output "alb_dns_name" { value = aws_lb.api.dns_name }
+output "ecr_repository_url" { value = aws_ecr_repository.service.repository_url }
+output "receipt_queue_url" { value = aws_sqs_queue.receipts.url }
+output "dead_letter_queue_url" { value = aws_sqs_queue.dead_letter.url }
+output "runtime_secret_arn" { value = aws_secretsmanager_secret.runtime.arn }
+output "github_deploy_role_arn" { value = aws_iam_role.github_deploy.arn }
+output "database_endpoint" { value = aws_db_instance.postgres.address }
+output "ecs_cluster_name" { value = aws_ecs_cluster.main.name }
+output "api_task_definition_arn" { value = aws_ecs_task_definition.api.arn }
+output "private_subnet_ids" { value = aws_subnet.private[*].id }
+output "service_security_group_id" { value = aws_security_group.service.id }

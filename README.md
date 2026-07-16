@@ -8,9 +8,9 @@ Production monorepo for a capped, real-data construction receipt pilot. Cloudfla
 - `review.challanse.constrovet.com`: Cloudflare Access-protected reviewer inbox.
 - `api.challanse.constrovet.com`: Cloudflare Worker API, queue consumer, and retention scheduler.
 - `apps/mobile`: Android 8+ offline-first capture app for enrolled site devices.
-- `services/enrichment`: signed FastAPI/Celery boundary for OCR, GST, reconciliation, grouped notifications, credit data, and telemetry.
+- `services/enrichment`: signed FastAPI/SQS service for enrichment, reconciliation, grouped digest records, and telemetry.
 
-Private WebP images are stored in R2, receipt and audit records in D1, and receipt identifiers only in Cloudflare Queues. The Android queue uses OP-SQLite compiled with SQLCipher, a Keystore-held database key, 256 KB resumable upload parts, and a manual shutter. OCR, GST, AWS, WhatsApp, Slack, and credit adapters remain disabled until separately approved and configured.
+Private WebP images are stored in R2 and capture records in D1. AWS Mumbai runs SQS workers and encrypted PostgreSQL for enrichment and reconciliation. The Android queue uses OP-SQLite compiled with SQLCipher, a Keystore-held database key, 256 KB resumable upload parts, and a manual shutter. Manual review and Tally CSV reconciliation are active; OCR, GST, WhatsApp, Slack, and credit adapters remain disabled until separately approved.
 
 ## Local validation
 
@@ -23,6 +23,7 @@ npm test
 npm run test:enrichment
 npm run build
 bash scripts/test-edge-integration.sh
+bash scripts/test-production-config.sh
 npm run build --workspace @challanse/mobile
 ```
 
@@ -51,6 +52,11 @@ git pull --ff-only
 ./scripts/go-live.sh provision
 ./scripts/go-live.sh configure-github
 ./scripts/go-live.sh rotate-signing
+./scripts/go-live.sh configure-aws
+./scripts/go-live.sh configure-enrichment
+./scripts/go-live.sh accept-staging /secure/staging-acceptance.json
+./scripts/go-live.sh accept-android-field /secure/android-field-acceptance.json
+./scripts/go-live.sh harden-github
 ./scripts/go-live.sh deploy
 ```
 
@@ -75,6 +81,12 @@ Set `PILOT_DEPLOY_ENABLED` as a repository variable. Configure the GitHub `produ
 | Secret | `CHALLANSE_KEYSTORE_PASSWORD` |
 | Secret | `CHALLANSE_KEY_ALIAS` |
 | Secret | `CHALLANSE_KEY_PASSWORD` |
+| Secret | `EDGE_TO_ENRICHMENT_HMAC_KEY` and `EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY` |
+| Secret | `ENRICHMENT_TO_EDGE_HMAC_KEY` and `ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY` |
+| Secret | `ENRICHMENT_ACCESS_CLIENT_ID` and `ENRICHMENT_ACCESS_CLIENT_SECRET` |
+| Variable | `EDGE_TO_ENRICHMENT_HMAC_KEY_ID` and `EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID` |
+| Variable | `ENRICHMENT_TO_EDGE_HMAC_KEY_ID` and `ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID` |
+| Variable | `AWS_ENRICHMENT_BOOTSTRAPPED` (`false` until AWS acceptance) |
 
 The Cloudflare token needs Zone Read, Zone DNS Edit, Dynamic URL Redirects Edit, and Zone Edit for onboarding, plus Workers Scripts, D1, R2, Queues, Turnstile Sites, Access Apps and Policies, and Access Organization Read for production provisioning. Scope it to the Constrovet account and domain. Initialize the account’s Zero Trust organization once before `provision`. Install `cloudflared` for authenticated production verification. The CLI generates the device pepper with a cryptographically secure 32-byte random value and never commits it.
 
@@ -101,13 +113,13 @@ The first reviewer entered during provisioning is the administrator; the second 
 
 ## Deployment safety
 
-Production deployment is intentionally disabled unless `PILOT_DEPLOY_ENABLED=true`. Protected `main` runs contract, Worker, migration, integration, security audit, reviewer, accessibility, Android unit, and Android debug-build checks first. Production uses the GitHub `production` environment approval gate.
+Production deployment is intentionally disabled unless the guarded CLI temporarily sets `PILOT_DEPLOY_ENABLED=true`. Protected `main` requires `validate`, `android`, `enrichment`, `security`, `integration`, and `terraform-plan`. The CLI also requires rotated signing evidence, AWS bootstrap, staging acceptance, Android field acceptance, and exact `DEPLOY <commit-sha>` confirmation.
 
-The enrichment service intentionally returns `503` instead of acknowledging and dropping an event when Celery/Redis is disabled or unavailable. Staging may use deterministic `mock` adapters. Production provider modes remain `disabled` until credentials, legal approval, redaction review, and provider-specific acceptance tests are complete. See `docs/hybrid-enrichment.md`.
+The enrichment API returns `202` only after SQS accepts a signed, idempotently reserved event. SQS workers acknowledge only after PostgreSQL commit and a successful Cloudflare callback. Staging may use deterministic mock adapters; production forbids mocks and keeps external providers disabled until credentials, legal approval, redaction review, and provider-specific acceptance tests are complete. See `docs/hybrid-enrichment.md`.
 
-The capped pilot is designed around the free allowances, not an uptime guarantee: [D1 free-plan recovery is limited](https://developers.cloudflare.com/d1/platform/limits/), [R2 includes 10 GB-month of standard storage](https://developers.cloudflare.com/r2/pricing/), and [Queues includes 10,000 operations per day](https://developers.cloudflare.com/queues/platform/pricing/). Recheck these limits before enabling production because provider allowances can change.
+The capped pilot has no formal SLA. Its documented target is recovery within one business day with no more than 24 hours of data loss. AWS costs require an operator-approved budget. Cloudflare storage remains globally distributed, so India-only residency is not claimed.
 
-Follow `docs/dns-cutover.md` before changing nameservers and `docs/pilot-runbook.md` for field rollout and rollback. Zero-budget operation provides no uptime SLA and no independent off-provider backup.
+Follow `docs/dns-cutover.md`, `docs/aws-bootstrap.md`, `docs/pilot-runbook.md`, and `docs/release-readiness.md` before field rollout. Repository code does not prove that live AWS accounts, restore drills, or field acceptance exist; those require recorded operator evidence.
 
 Emergency stop, preserving every receipt and image:
 

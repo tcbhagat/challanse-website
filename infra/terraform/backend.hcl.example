@@ -1,0 +1,4 @@
+bucket       = "replace-with-account-specific-versioned-state-bucket"
+region       = "ap-south-1"
+kms_key_id   = "replace-with-state-kms-key-arn"
+use_lockfile = true

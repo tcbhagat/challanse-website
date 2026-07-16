@@ -19,7 +19,7 @@ import {
 } from './security';
 import type { DeviceIdentity, Env, ReceiptQueueMessage, ReviewerIdentity } from './types';
 import { completeUploadSession, createUploadSession, getUploadSession, putUploadPart } from './resumableUploads';
-import { dispatchEnrichment, enrichmentCallback, internalReceiptImage } from './enrichment';
+import { callEnrichment, dispatchEnrichment, enrichmentCallback, internalReceiptImage } from './enrichment';
 
 const MAX_PAGE_SIZE = 50;
 const IMAGE_RETENTION_DAYS = 90;
@@ -241,14 +241,14 @@ async function listReceipts(request: Request, env: Env, reviewer: ReviewerIdenti
   const cursor = url.searchParams.get('cursor') ?? '9999-12-31 23:59:59';
   const result = await env.DB.prepare(
     `SELECT r.id, r.vendor_id, v.name AS vendor_name, r.captured_at_unix, r.captured_quantity, r.status, r.version,
-            r.challan_number, r.material_description, r.verified_quantity, r.unit, r.notes, r.created_at,
+            r.challan_number, r.po_number, r.material_code, r.material_description, r.verified_quantity, r.unit, r.notes, r.created_at,
             r.enrichment_status, r.ocr_confidence, r.raw_ocr_json, r.gst_status
        FROM receipts r JOIN vendors v ON v.id = r.vendor_id
       WHERE r.site_id = ? AND r.status = ? AND r.created_at < ?
       ORDER BY r.created_at DESC LIMIT ?`,
   ).bind(reviewer.siteId, status, cursor, limit + 1).all<{
     id: string; vendor_id: string; vendor_name: string; captured_at_unix: number; captured_quantity: number;
-    status: ReceiptListItem['status']; version: number; challan_number: string; material_description: string;
+    status: ReceiptListItem['status']; version: number; challan_number: string; po_number: string; material_code: string; material_description: string;
     verified_quantity: number | null; unit: string; notes: string; created_at: string; enrichment_status: string;
     ocr_confidence: number | null; raw_ocr_json: string; gst_status: string;
   }>();
@@ -264,6 +264,8 @@ async function listReceipts(request: Request, env: Env, reviewer: ReviewerIdenti
     version: row.version,
     imageUrl: `/v1/reviewer/receipts/${row.id}/image`,
     challanNumber: row.challan_number,
+    poNumber: row.po_number,
+    materialCode: row.material_code,
     materialDescription: row.material_description,
     verifiedQuantity: row.verified_quantity,
     unit: row.unit,
@@ -303,23 +305,126 @@ async function reviewReceipt(request: Request, env: Env, reviewer: ReviewerIdent
   }
   const nextStatus = review.action === 'VERIFY' ? 'VERIFIED' : 'REJECTED';
   const updated = await env.DB.prepare(
-    `UPDATE receipts SET status = ?, challan_number = ?, material_description = ?, verified_quantity = ?, unit = ?, notes = ?,
+    `UPDATE receipts SET status = ?, challan_number = ?, po_number = ?, material_code = ?, material_description = ?, verified_quantity = ?, unit = ?, notes = ?,
        reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP, version = version + 1, updated_at = CURRENT_TIMESTAMP
      WHERE id = ? AND site_id = ? AND version = ? AND status = 'NEEDS_REVIEW'`,
   ).bind(
-    nextStatus, review.challanNumber, review.materialDescription, review.verifiedQuantity, review.unit, review.notes,
+    nextStatus, review.challanNumber, review.poNumber.toUpperCase(), review.materialCode.toUpperCase(), review.materialDescription, review.verifiedQuantity, review.unit, review.notes,
     reviewer.email, receiptId, reviewer.siteId, review.version,
   ).run();
   if (Number(updated.meta.changes ?? 0) !== 1) {
     return error(request, env, 409, 'REVIEW_CONFLICT', 'Receipt changed or is no longer awaiting review. Refresh before retrying.');
   }
+  const reviewEvent = {
+    receipt_id: receiptId,
+    site_id: reviewer.siteId,
+    po_number: review.poNumber.toUpperCase(),
+    material_code: review.materialCode.toUpperCase(),
+    verified_quantity: review.verifiedQuantity,
+    unit: review.unit.toUpperCase(),
+    reviewer_id: reviewer.email,
+    review_version: review.version + 1,
+    reviewed_at_iso8601: new Date().toISOString(),
+    schema_version: '1.0',
+  };
   await env.DB.prepare(
     `INSERT INTO receipt_audits (id, receipt_id, site_id, event_type, actor, event_json) VALUES (?, ?, ?, ?, ?, ?)`,
   ).bind(
     crypto.randomUUID(), receiptId, reviewer.siteId, nextStatus, reviewer.email,
-    JSON.stringify({ challanNumber: review.challanNumber, materialDescription: review.materialDescription, verifiedQuantity: review.verifiedQuantity, unit: review.unit, notes: review.notes }),
+    JSON.stringify({ challanNumber: review.challanNumber, poNumber: review.poNumber, materialCode: review.materialCode, materialDescription: review.materialDescription, verifiedQuantity: review.verifiedQuantity, unit: review.unit, notes: review.notes }),
   ).run();
+  if (nextStatus === 'VERIFIED') {
+    await env.DB.prepare(
+      `INSERT INTO review_projection_outbox (receipt_id, site_id, payload_json)
+       VALUES (?, ?, ?) ON CONFLICT(receipt_id) DO UPDATE SET payload_json = excluded.payload_json, status = 'PENDING', available_at = CURRENT_TIMESTAMP`,
+    ).bind(receiptId, reviewer.siteId, JSON.stringify(reviewEvent)).run();
+  }
+  if (nextStatus === 'VERIFIED' && env.ENRICHMENT_URL) {
+    try {
+      const response = await callEnrichment(env, '/v1/events/reviews', reviewEvent);
+      if (!response.ok) throw new Error(`review_projection_${response.status}`);
+      await env.DB.prepare(`UPDATE review_projection_outbox SET status = 'DELIVERED', attempts = attempts + 1, delivered_at = CURRENT_TIMESTAMP WHERE receipt_id = ?`)
+        .bind(receiptId).run();
+    } catch {
+      await env.DB.prepare(`UPDATE review_projection_outbox SET attempts = attempts + 1, available_at = datetime('now', '+1 minute') WHERE receipt_id = ?`)
+        .bind(receiptId).run();
+    }
+  }
   return json(request, env, { receiptId, status: nextStatus, version: review.version + 1 });
+}
+
+async function importPurchaseOrders(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
+  const body = await parseJson(request) as { csvContent?: unknown };
+  if (typeof body.csvContent !== 'string' || body.csvContent.length < 1 || body.csvContent.length > 1_000_000) {
+    return error(request, env, 400, 'INVALID_TALLY_CSV', 'A Tally CSV file below 1 MB is required.');
+  }
+  try {
+    const response = await callEnrichment(env, '/v1/reviewer/po-imports', {
+      site_id: reviewer.siteId,
+      imported_by: reviewer.email,
+      csv_content: body.csvContent,
+    });
+    const payload = await response.text();
+    return new Response(payload, { status: response.status, headers: { ...corsHeaders(request, env), 'Content-Type': 'application/json' } });
+  } catch {
+    return error(request, env, 503, 'RECONCILIATION_UNAVAILABLE', 'Purchase-order import is temporarily unavailable.');
+  }
+}
+
+async function listReconciliation(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
+  try {
+    const response = await callEnrichment(env, '/v1/reviewer/reconciliation/query', { site_id: reviewer.siteId });
+    const raw = await response.json<{ rows?: Array<Record<string, unknown>> }>();
+    if (!response.ok) return error(request, env, 503, 'RECONCILIATION_UNAVAILABLE', 'Reconciliation is temporarily unavailable.');
+    const rows = (raw.rows ?? []).map((row) => ({
+      poNumber: row.po_number,
+      materialCode: row.material_code,
+      unit: row.unit,
+      poQuantity: row.po_quantity,
+      siteReceived: row.site_received,
+      isOver: row.is_over,
+    }));
+    return json(request, env, { rows });
+  } catch {
+    return error(request, env, 503, 'RECONCILIATION_UNAVAILABLE', 'Reconciliation is temporarily unavailable.');
+  }
+}
+
+async function listDigestHistory(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
+  try {
+    const response = await callEnrichment(env, '/v1/reviewer/digests/query', { site_id: reviewer.siteId });
+    const payload = await response.text();
+    return new Response(payload, { status: response.status, headers: { ...corsHeaders(request, env), 'Content-Type': 'application/json' } });
+  } catch {
+    return error(request, env, 503, 'DIGEST_HISTORY_UNAVAILABLE', 'Digest history is temporarily unavailable.');
+  }
+}
+
+async function listEnrichmentStatus(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
+  const receiptId = new URL(request.url).searchParams.get('receiptId');
+  if (receiptId && !/^[0-9a-f-]{36}$/i.test(receiptId)) return error(request, env, 400, 'INVALID_RECEIPT_ID', 'Receipt ID is invalid.');
+  try {
+    const response = await callEnrichment(env, '/v1/reviewer/enrichment-status/query', { site_id: reviewer.siteId, receipt_id: receiptId || null });
+    const payload = await response.text();
+    return new Response(payload, { status: response.status, headers: { ...corsHeaders(request, env), 'Content-Type': 'application/json' } });
+  } catch {
+    return error(request, env, 503, 'ENRICHMENT_STATUS_UNAVAILABLE', 'Enrichment status is temporarily unavailable.');
+  }
+}
+
+async function configureSiteManager(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
+  const body = await parseJson(request) as { managerId?: unknown; active?: unknown };
+  const managerId = String(body.managerId ?? '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(managerId) || managerId.length > 254 || typeof body.active !== 'boolean') {
+    return error(request, env, 400, 'INVALID_SITE_MANAGER', 'A valid manager email and active state are required.');
+  }
+  try {
+    const response = await callEnrichment(env, '/v1/admin/site-managers', { site_id: reviewer.siteId, manager_id: managerId, active: body.active });
+    if (!response.ok) return error(request, env, 503, 'SITE_MANAGER_UNAVAILABLE', 'Site manager configuration is temporarily unavailable.');
+    return new Response(null, { status: 204, headers: corsHeaders(request, env) });
+  } catch {
+    return error(request, env, 503, 'SITE_MANAGER_UNAVAILABLE', 'Site manager configuration is temporarily unavailable.');
+  }
 }
 
 async function createEnrollmentCode(request: Request, env: Env, reviewer: ReviewerIdentity): Promise<Response> {
@@ -392,6 +497,38 @@ async function submitPilotRequest(request: Request, env: Env): Promise<Response>
   return json(request, env, { status: 'accepted' }, 202);
 }
 
+async function submitMobileTelemetry(request: Request, env: Env, device: DeviceIdentity): Promise<Response> {
+  const payload = await parseJson(request) as { measurements?: Array<Record<string, unknown>> };
+  if (!Array.isArray(payload.measurements) || payload.measurements.length < 1 || payload.measurements.length > 100) {
+    return error(request, env, 400, 'INVALID_TELEMETRY', 'A bounded telemetry batch is required.');
+  }
+  const allowed = new Set(['frontend_write_duration_ms', 'sync_failure_rate']);
+  const measurements = payload.measurements.map((measurement) => ({
+    source_event_id: `${device.id}:${String(measurement.source_event_id ?? '')}`,
+    site_id: device.siteId,
+    vendor_id: typeof measurement.vendor_id === 'string' ? measurement.vendor_id : null,
+    metric_name: measurement.metric_name,
+    metric_value: measurement.metric_value,
+    sample_count: measurement.sample_count,
+    period_start: measurement.period_start,
+    period_end: measurement.period_end,
+  }));
+  if (measurements.some((measurement) => !allowed.has(String(measurement.metric_name))
+    || measurement.source_event_id.length < 3 || measurement.source_event_id.length > 160
+    || typeof measurement.metric_value !== 'number' || measurement.metric_value < 0
+    || !Number.isInteger(measurement.sample_count) || Number(measurement.sample_count) < 1
+    || typeof measurement.period_start !== 'string' || typeof measurement.period_end !== 'string')) {
+    return error(request, env, 400, 'INVALID_TELEMETRY', 'Telemetry values are invalid.');
+  }
+  try {
+    const response = await callEnrichment(env, '/v1/events/telemetry', { measurements });
+    if (!response.ok) return error(request, env, 503, 'TELEMETRY_UNAVAILABLE', 'Telemetry remains queued on this device.');
+    return json(request, env, { accepted: measurements.length }, 202);
+  } catch {
+    return error(request, env, 503, 'TELEMETRY_UNAVAILABLE', 'Telemetry remains queued on this device.');
+  }
+}
+
 async function handleRequest(request: Request, env: Env): Promise<Response> {
   const path = requestPath(request);
   if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(request, env) });
@@ -412,10 +549,11 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   const callbackMatch = path.match(/^\/v1\/internal\/receipts\/([^/]+)\/enrichment$/);
   if (request.method === 'POST' && callbackMatch) return enrichmentCallback(request, env, callbackMatch[1]);
 
-  if (path === '/v1/mobile/bootstrap' || path === '/v1/receipts') {
+  if (path === '/v1/mobile/bootstrap' || path === '/v1/mobile/telemetry' || path === '/v1/receipts') {
     const device = await requireDevice(request, env);
     if (device instanceof Response) return device;
     if (request.method === 'GET' && path === '/v1/mobile/bootstrap') return mobileBootstrap(request, env, device);
+    if (request.method === 'POST' && path === '/v1/mobile/telemetry') return submitMobileTelemetry(request, env, device);
     if (request.method === 'POST' && path === '/v1/receipts') return uploadReceipt(request, env, device);
   }
 
@@ -447,11 +585,16 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const reviewer = await requireReviewer(request, env, path.startsWith('/v1/admin/'));
     if (reviewer instanceof Response) return reviewer;
     if (request.method === 'GET' && path === '/v1/reviewer/receipts') return listReceipts(request, env, reviewer);
+    if (request.method === 'POST' && path === '/v1/reviewer/po-imports') return importPurchaseOrders(request, env, reviewer);
+    if (request.method === 'GET' && path === '/v1/reviewer/reconciliation') return listReconciliation(request, env, reviewer);
+    if (request.method === 'GET' && path === '/v1/reviewer/digests') return listDigestHistory(request, env, reviewer);
+    if (request.method === 'GET' && path === '/v1/reviewer/enrichment-status') return listEnrichmentStatus(request, env, reviewer);
     const imageMatch = path.match(/^\/v1\/reviewer\/receipts\/([^/]+)\/image$/);
     if (request.method === 'GET' && imageMatch) return getReceiptImage(request, env, reviewer, imageMatch[1]);
     const receiptMatch = path.match(/^\/v1\/reviewer\/receipts\/([^/]+)$/);
     if (request.method === 'PATCH' && receiptMatch) return reviewReceipt(request, env, reviewer, receiptMatch[1]);
     if (request.method === 'POST' && path === '/v1/admin/enrollment-codes') return createEnrollmentCode(request, env, reviewer);
+    if (request.method === 'PUT' && path === '/v1/admin/site-manager') return configureSiteManager(request, env, reviewer);
     if (request.method === 'GET' && path === '/v1/admin/summary') return adminSummary(request, env, reviewer);
     const deviceMatch = path.match(/^\/v1\/admin\/devices\/([^/]+)$/);
     if (request.method === 'DELETE' && deviceMatch) return revokeDevice(request, env, reviewer, deviceMatch[1]);
@@ -464,10 +607,10 @@ async function consumeReceipts(batch: MessageBatch<ReceiptQueueMessage>, env: En
     const { receiptId, siteId } = message.body;
     try {
       const receipt = await env.DB.prepare(
-        `SELECT image_key, enrichment_status, vendor_id, captured_at_unix, captured_quantity
+        `SELECT image_key, image_sha256, image_bytes, enrichment_status, vendor_id, captured_at_unix, captured_quantity
          FROM receipts WHERE id = ? AND site_id = ? LIMIT 1`,
       ).bind(receiptId, siteId).first<{
-        image_key: string; enrichment_status: string; vendor_id: string; captured_at_unix: number; captured_quantity: number;
+        image_key: string; image_sha256: string; image_bytes: number; enrichment_status: string; vendor_id: string; captured_at_unix: number; captured_quantity: number;
       }>();
       if (!receipt || !(await env.RECEIPTS.head(receipt.image_key))) throw new Error('durable_image_missing');
       const result = await env.DB.prepare(
@@ -484,6 +627,8 @@ async function consumeReceipts(batch: MessageBatch<ReceiptQueueMessage>, env: En
           id: receiptId,
           siteId,
           imageKey: receipt.image_key,
+          imageSha256: receipt.image_sha256,
+          imageBytes: receipt.image_bytes,
           vendorId: receipt.vendor_id,
           capturedAtUnix: receipt.captured_at_unix,
           capturedQuantity: receipt.captured_quantity,
@@ -512,15 +657,17 @@ async function reconcileAndRetain(env: Env): Promise<void> {
   }
 
   const pendingEnrichment = await env.DB.prepare(
-    `SELECT id, site_id, image_key, vendor_id, captured_at_unix, captured_quantity FROM receipts
+    `SELECT id, site_id, image_key, image_sha256, image_bytes, vendor_id, captured_at_unix, captured_quantity FROM receipts
      WHERE enrichment_status = 'PENDING' AND image_deleted_at IS NULL ORDER BY created_at LIMIT 50`,
-  ).all<{ id: string; site_id: string; image_key: string; vendor_id: string; captured_at_unix: number; captured_quantity: number }>();
+  ).all<{ id: string; site_id: string; image_key: string; image_sha256: string; image_bytes: number; vendor_id: string; captured_at_unix: number; captured_quantity: number }>();
   for (const receipt of pendingEnrichment.results) {
     try {
       const enrichmentStatus = await dispatchEnrichment(env, {
         id: receipt.id,
         siteId: receipt.site_id,
         imageKey: receipt.image_key,
+        imageSha256: receipt.image_sha256,
+        imageBytes: receipt.image_bytes,
         vendorId: receipt.vendor_id,
         capturedAtUnix: receipt.captured_at_unix,
         capturedQuantity: receipt.captured_quantity,
@@ -549,17 +696,45 @@ async function reconcileAndRetain(env: Env): Promise<void> {
     env.DB.prepare(`UPDATE upload_sessions SET status = 'ABORTED', updated_at = CURRENT_TIMESTAMP WHERE status = 'OPEN' AND expires_at < CURRENT_TIMESTAMP`),
   ]);
 
+  const reviewProjections = await env.DB.prepare(
+    `SELECT receipt_id, payload_json FROM review_projection_outbox
+     WHERE status = 'PENDING' AND available_at <= CURRENT_TIMESTAMP ORDER BY created_at LIMIT 25`,
+  ).all<{ receipt_id: string; payload_json: string }>();
+  for (const projection of reviewProjections.results) {
+    try {
+      const response = await callEnrichment(env, '/v1/events/reviews', JSON.parse(projection.payload_json));
+      if (!response.ok) throw new Error(`review_projection_${response.status}`);
+      await env.DB.prepare(`UPDATE review_projection_outbox SET status = 'DELIVERED', attempts = attempts + 1, delivered_at = CURRENT_TIMESTAMP WHERE receipt_id = ?`)
+        .bind(projection.receipt_id).run();
+    } catch {
+      await env.DB.prepare(`UPDATE review_projection_outbox SET attempts = attempts + 1, available_at = datetime('now', '+' || MIN(60, 1 << MIN(attempts, 6)) || ' minutes') WHERE receipt_id = ?`)
+        .bind(projection.receipt_id).run();
+    }
+  }
+
   const expiredImages = await env.DB.prepare(
     `SELECT id, site_id, image_key, image_bytes FROM receipts
      WHERE image_deleted_at IS NULL AND created_at < datetime('now', '-${IMAGE_RETENTION_DAYS} days') LIMIT 100`,
   ).all<{ id: string; site_id: string; image_key: string; image_bytes: number }>();
   for (const receipt of expiredImages.results) {
-    await env.RECEIPTS.delete(receipt.image_key);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE receipts SET image_deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(receipt.id),
-      env.DB.prepare(`UPDATE sites SET stored_image_bytes = MAX(0, stored_image_bytes - ?) WHERE id = ?`).bind(receipt.image_bytes, receipt.site_id),
-    ]);
+    const tombstoneId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO retention_tombstones (id, receipt_id, resource_type) VALUES (?, ?, 'R2_IMAGE')
+       ON CONFLICT(receipt_id, resource_type) DO UPDATE SET status = 'PENDING'`,
+    ).bind(tombstoneId, receipt.id).run();
+    try {
+      await env.RECEIPTS.delete(receipt.image_key);
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE receipts SET image_deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(receipt.id),
+        env.DB.prepare(`UPDATE sites SET stored_image_bytes = MAX(0, stored_image_bytes - ?) WHERE id = ?`).bind(receipt.image_bytes, receipt.site_id),
+        env.DB.prepare(`UPDATE retention_tombstones SET status = 'COMPLETED', completed_at = CURRENT_TIMESTAMP WHERE receipt_id = ? AND resource_type = 'R2_IMAGE'`).bind(receipt.id),
+      ]);
+    } catch {
+      await env.DB.prepare(`UPDATE retention_tombstones SET status = 'FAILED_RETRYABLE' WHERE receipt_id = ? AND resource_type = 'R2_IMAGE'`)
+        .bind(receipt.id).run();
+    }
   }
+  await env.DB.prepare(`DELETE FROM review_projection_outbox WHERE receipt_id IN (SELECT id FROM receipts WHERE created_at < datetime('now', '-${AUDIT_RETENTION_DAYS} days'))`).run();
   await env.DB.prepare(`DELETE FROM receipts WHERE created_at < datetime('now', '-${AUDIT_RETENTION_DAYS} days')`).run();
   await env.DB.prepare(`DELETE FROM operations_log WHERE created_at < datetime('now', '-${AUDIT_RETENTION_DAYS} days')`).run();
 }

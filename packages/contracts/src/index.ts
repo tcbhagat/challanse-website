@@ -35,6 +35,8 @@ export const receiptReviewSchema = z.object({
   action: z.enum(['VERIFY', 'REJECT']),
   version: z.number().int().positive(),
   challanNumber: z.string().trim().max(120).default(''),
+  poNumber: z.string().trim().min(1).max(120),
+  materialCode: z.string().trim().min(1).max(120),
   materialDescription: z.string().trim().min(1).max(500),
   verifiedQuantity: z.number().positive().max(1_000_000_000),
   unit: z.string().trim().min(1).max(24),
@@ -77,6 +79,8 @@ export type ReceiptListItem = {
   version: number;
   imageUrl: string;
   challanNumber: string;
+  poNumber: string;
+  materialCode: string;
   materialDescription: string;
   verifiedQuantity: number | null;
   unit: string;
@@ -85,4 +89,13 @@ export type ReceiptListItem = {
   ocrConfidence: number | null;
   rawOcrJson: Record<string, unknown>;
   gstStatus: string;
+};
+
+export type ReconciliationRow = {
+  poNumber: string;
+  materialCode: string;
+  unit: string;
+  poQuantity: number;
+  siteReceived: number;
+  isOver: boolean;
 };

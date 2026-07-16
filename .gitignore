@@ -14,3 +14,9 @@ apps/mobile/android/*.keystore
 apps/mobile/package-lock.json
 apps/edge/wrangler.generated.toml
 *.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.terraform/
+*.tfstate
+*.tfstate.*
