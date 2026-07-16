@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 
-import psycopg
 from psycopg.types.json import Jsonb
 
 from .schemas import ReceiptEvent
+from .tenancy import system_connection, tenant_connection
 
 
 @dataclass(frozen=True)
@@ -32,8 +32,8 @@ class IngressConflict(RuntimeError):
 class MemoryIngressStore(IngressStore):
     def __init__(self) -> None:
         self.requests: dict[str, tuple[str, str | None, str, str]] = {}
-        self.request_receipts: dict[str, str] = {}
-        self.receipts: set[str] = set()
+        self.request_receipts: dict[str, tuple[str, str]] = {}
+        self.receipts: set[tuple[str, str]] = set()
 
     def reserve(self, request_id: str, key_id: str, content_sha256: str, event: ReceiptEvent) -> IngressReservation:
         existing = self.requests.get(request_id)
@@ -41,12 +41,13 @@ class MemoryIngressStore(IngressStore):
             if existing[2] != key_id or existing[3] != content_sha256:
                 raise IngressConflict("request_id_reused_with_different_content")
             return IngressReservation(True, existing[0], existing[1], request_id)
-        if event.receipt_id in self.receipts:
+        receipt_key = (event.organization_id, event.receipt_id)
+        if receipt_key in self.receipts:
             self.requests[request_id] = ("DUPLICATE", event.receipt_id, key_id, content_sha256)
             return IngressReservation(True, "DUPLICATE", event.receipt_id, request_id)
         self.requests[request_id] = ("RESERVED", None, key_id, content_sha256)
-        self.request_receipts[request_id] = event.receipt_id
-        self.receipts.add(event.receipt_id)
+        self.request_receipts[request_id] = receipt_key
+        self.receipts.add(receipt_key)
         return IngressReservation(False, "RESERVED", None, request_id)
 
     def mark_queued(self, request_id: str, task_id: str) -> None:
@@ -55,9 +56,9 @@ class MemoryIngressStore(IngressStore):
 
     def release(self, request_id: str) -> None:
         self.requests.pop(request_id, None)
-        receipt_id = self.request_receipts.pop(request_id, None)
-        if receipt_id:
-            self.receipts.discard(receipt_id)
+        receipt_key = self.request_receipts.pop(request_id, None)
+        if receipt_key:
+            self.receipts.discard(receipt_key)
 
 
 class PostgresIngressStore(IngressStore):
@@ -67,7 +68,7 @@ class PostgresIngressStore(IngressStore):
         self.database_url = database_url
 
     def reserve(self, request_id: str, key_id: str, content_sha256: str, event: ReceiptEvent) -> IngressReservation:
-        with psycopg.connect(self.database_url) as connection:
+        with tenant_connection(self.database_url, event.organization_id) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT status, task_id, key_id, content_sha256 FROM service_ingress_requests WHERE request_id = %s",
@@ -79,8 +80,8 @@ class PostgresIngressStore(IngressStore):
                         raise IngressConflict("request_id_reused_with_different_content")
                     return IngressReservation(True, str(existing[0]), str(existing[1]) if existing[1] else None, request_id)
                 cursor.execute(
-                    "SELECT request_id, status, task_id FROM service_ingress_requests WHERE receipt_id = %s ORDER BY created_at DESC LIMIT 1",
-                    (event.receipt_id,),
+                    "SELECT request_id, status, task_id FROM service_ingress_requests WHERE organization_id = %s AND receipt_id = %s ORDER BY created_at DESC LIMIT 1",
+                    (event.organization_id, event.receipt_id),
                 )
                 receipt_existing = cursor.fetchone()
                 if receipt_existing:
@@ -93,18 +94,18 @@ class PostgresIngressStore(IngressStore):
                 cursor.execute(
                     """
                     INSERT INTO service_ingress_requests
-                      (request_id, receipt_id, key_id, content_sha256, status, event_json)
-                    VALUES (%s, %s, %s, %s, 'RESERVED', %s)
+                      (request_id, organization_id, receipt_id, key_id, content_sha256, status, event_json)
+                    VALUES (%s, %s, %s, %s, %s, 'RESERVED', %s)
                     ON CONFLICT DO NOTHING
                     RETURNING request_id
                     """,
-                    (request_id, event.receipt_id, key_id, content_sha256, Jsonb(event.model_dump(mode="json"))),
+                    (request_id, event.organization_id, event.receipt_id, key_id, content_sha256, Jsonb(event.model_dump(mode="json"))),
                 )
                 inserted = cursor.fetchone()
                 if not inserted:
                     cursor.execute(
-                        "SELECT request_id, status, task_id, key_id, content_sha256 FROM service_ingress_requests WHERE request_id = %s OR receipt_id = %s ORDER BY request_id = %s DESC LIMIT 1",
-                        (request_id, event.receipt_id, request_id),
+                        "SELECT request_id, status, task_id, key_id, content_sha256 FROM service_ingress_requests WHERE request_id = %s OR (organization_id = %s AND receipt_id = %s) ORDER BY request_id = %s DESC LIMIT 1",
+                        (request_id, event.organization_id, event.receipt_id, request_id),
                     )
                     concurrent = cursor.fetchone()
                     if not concurrent:
@@ -121,7 +122,7 @@ class PostgresIngressStore(IngressStore):
         return IngressReservation(False, "RESERVED", None, request_id)
 
     def mark_queued(self, request_id: str, task_id: str) -> None:
-        with psycopg.connect(self.database_url) as connection:
+        with system_connection(self.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "UPDATE service_ingress_requests SET status = 'QUEUED', task_id = %s, queued_at = NOW() WHERE request_id = %s",
@@ -130,7 +131,7 @@ class PostgresIngressStore(IngressStore):
             connection.commit()
 
     def release(self, request_id: str) -> None:
-        with psycopg.connect(self.database_url) as connection:
+        with system_connection(self.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM service_ingress_requests WHERE request_id = %s AND status = 'RESERVED'",

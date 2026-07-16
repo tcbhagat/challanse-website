@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from io import StringIO
 from uuid import uuid4
 
-import psycopg
 from psycopg.rows import dict_row
 
 from .schemas import VerifiedReviewEvent
+from .tenancy import tenant_connection
 
 
 @dataclass(frozen=True)
@@ -62,40 +62,40 @@ def delta_rows(received: dict[tuple[str, str, str], float], purchase_orders: lis
     ]
 
 
-def import_tally_csv(database_url: str, site_id: str, imported_by: str, content: str) -> tuple[str, bool, int]:
+def import_tally_csv(database_url: str, organization_id: str, site_id: str, imported_by: str, content: str) -> tuple[str, bool, int]:
     rows = parse_tally_csv(content)
     checksum = hashlib.sha256(content.replace("\r\n", "\n").encode("utf-8")).hexdigest()
     import_id = uuid4()
-    with psycopg.connect(database_url) as connection:
+    with tenant_connection(database_url, organization_id) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT id FROM tally_imports WHERE site_id = %s AND checksum = %s", (site_id, checksum))
             existing = cursor.fetchone()
             if existing:
                 return str(existing[0]), True, len(rows)
             cursor.execute(
-                "INSERT INTO tally_imports (id, site_id, checksum, imported_by) VALUES (%s, %s, %s, %s)",
-                (import_id, site_id, checksum, imported_by),
+                "INSERT INTO tally_imports (id, organization_id, site_id, checksum, imported_by) VALUES (%s, %s, %s, %s, %s)",
+                (import_id, organization_id, site_id, checksum, imported_by),
             )
             cursor.executemany(
                 """
-                INSERT INTO tally_import_rows (id, import_id, site_id, po_number, material_code, quantity, unit)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO tally_import_rows (id, organization_id, import_id, site_id, po_number, material_code, quantity, unit)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                [(uuid4(), import_id, site_id, row.po_number, row.material_code, row.quantity, row.unit) for row in rows],
+                [(uuid4(), organization_id, import_id, site_id, row.po_number, row.material_code, row.quantity, row.unit) for row in rows],
             )
         connection.commit()
     return str(import_id), False, len(rows)
 
 
 def record_verified_review(database_url: str, event: VerifiedReviewEvent) -> None:
-    with psycopg.connect(database_url) as connection:
+    with tenant_connection(database_url, event.organization_id) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO verified_receipts (
-                  receipt_id, site_id, po_number, material_code, verified_quantity, unit,
+                  receipt_id, organization_id, site_id, po_number, material_code, verified_quantity, unit,
                   reviewer_id, review_version, reviewed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)
                 ON CONFLICT (receipt_id) DO UPDATE SET
                   po_number = excluded.po_number, material_code = excluded.material_code,
                   verified_quantity = excluded.verified_quantity, unit = excluded.unit,
@@ -104,7 +104,7 @@ def record_verified_review(database_url: str, event: VerifiedReviewEvent) -> Non
                 WHERE verified_receipts.review_version < excluded.review_version
                 """,
                 (
-                    event.receipt_id, event.site_id, event.po_number.upper(), event.material_code.upper(),
+                    event.receipt_id, event.organization_id, event.site_id, event.po_number.upper(), event.material_code.upper(),
                     event.verified_quantity, normalize_unit(event.unit), event.reviewer_id,
                     event.review_version, event.reviewed_at_iso8601,
                 ),
@@ -112,8 +112,8 @@ def record_verified_review(database_url: str, event: VerifiedReviewEvent) -> Non
         connection.commit()
 
 
-def reconciliation_for_site(database_url: str, site_id: str) -> list[dict[str, object]]:
-    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+def reconciliation_for_site(database_url: str, organization_id: str, site_id: str) -> list[dict[str, object]]:
+    with tenant_connection(database_url, organization_id, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -137,8 +137,8 @@ def reconciliation_for_site(database_url: str, site_id: str) -> list[dict[str, o
     return delta_rows(received, po_rows)
 
 
-def digest_history_for_site(database_url: str, site_id: str) -> list[dict[str, object]]:
-    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+def digest_history_for_site(database_url: str, organization_id: str, site_id: str) -> list[dict[str, object]]:
+    with tenant_connection(database_url, organization_id, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -150,8 +150,8 @@ def digest_history_for_site(database_url: str, site_id: str) -> list[dict[str, o
             return [dict(row) for row in cursor.fetchall()]
 
 
-def enrichment_status_for_site(database_url: str, site_id: str, receipt_id: str | None = None) -> list[dict[str, object]]:
-    with psycopg.connect(database_url, row_factory=dict_row) as connection:
+def enrichment_status_for_site(database_url: str, organization_id: str, site_id: str, receipt_id: str | None = None) -> list[dict[str, object]]:
+    with tenant_connection(database_url, organization_id, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -167,14 +167,14 @@ def enrichment_status_for_site(database_url: str, site_id: str, receipt_id: str 
             return [dict(row) for row in cursor.fetchall()]
 
 
-def set_site_manager(database_url: str, site_id: str, manager_id: str, active: bool) -> None:
-    with psycopg.connect(database_url) as connection:
+def set_site_manager(database_url: str, organization_id: str, site_id: str, manager_id: str, active: bool) -> None:
+    with tenant_connection(database_url, organization_id) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO site_managers (site_id, manager_id, active) VALUES (%s, %s, %s)
+                INSERT INTO site_managers (organization_id, site_id, manager_id, active) VALUES (%s, %s, %s, %s)
                 ON CONFLICT (site_id, manager_id) DO UPDATE SET active = excluded.active
                 """,
-                (site_id, manager_id, active),
+                (organization_id, site_id, manager_id, active),
             )
         connection.commit()

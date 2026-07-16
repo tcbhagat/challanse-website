@@ -1,14 +1,15 @@
 # AWS account and Terraform bootstrap
 
-This is an operator procedure, not an automated AWS Organizations migration. Use separate staging and production accounts in AWS Mumbai (`ap-south-1`). Do not place long-lived AWS access keys in GitHub.
+Use separate staging and production accounts under AWS Organizations in Mumbai (`ap-south-1`). This procedure requires a privileged operator and must not store long-lived AWS credentials in GitHub.
 
 ## Per-account prerequisites
 
-1. Create the account under AWS Organizations and require MFA for privileged operators.
-2. Create a versioned, encrypted S3 Terraform-state bucket with public access blocked and a dedicated KMS key.
-3. Create the GitHub OIDC provider for `token.actions.githubusercontent.com` and a temporary bootstrap role restricted to `tcbhagat/challanse` protected `main` and the matching GitHub environment.
-4. Request and validate an ACM certificate for a dedicated enrichment origin hostname. Put that hostname behind Cloudflare Access with a service-token policy; do not expose it in public navigation.
-5. Set an operator-approved monthly AWS budget and notification email. Cost values are intentionally not committed.
+1. Require MFA for privileged operators and establish a break-glass role with monitored use.
+2. Create a versioned, encrypted Terraform-state bucket with public access blocked, dedicated KMS encryption, and S3 lockfile support.
+3. Create GitHub's OIDC provider and a temporary bootstrap role restricted to `tcbhagat/challanse`, protected `main`, and the matching GitHub environment.
+4. Issue the private-origin ACM certificate and configure Cloudflare Tunnel; never expose an unrestricted public origin.
+5. Supply an operator-approved monthly budget and business-hours alarm email.
+6. Create a separate backup account/vault and permit only recovery-copy operations from the workload account.
 
 ## Initial staging apply
 
@@ -22,33 +23,40 @@ terraform -chdir=infra/terraform/staging init \
 terraform -chdir=infra/terraform/staging plan \
   -var="container_image=<immutable-ecr-uri>@sha256:<digest>" \
   -var="adot_collector_image=<immutable-adot-image>@sha256:<digest>" \
+  -var="cloudflared_image=<immutable-cloudflared-image>@sha256:<digest>" \
+  -var="expected_aws_account_id=<staging-account-id>" \
   -var="certificate_arn=<staging-acm-arn>" \
+  -var="backup_destination_vault_arn=<backup-vault-arn>" \
+  -var="play_integrity_cloud_project_number=<project-number>" \
   -var="monthly_budget_usd=<approved-number>" \
   -var="budget_email=<operator-email>" \
   -var="github_oidc_provider_arn=<staging-oidc-provider-arn>" \
   -var="services_enabled=false"
 ```
 
-Review and apply the saved plan. The ADOT collector image must be an operator-reviewed immutable digest; it exports traces to AWS X-Ray and metrics to CloudWatch. Capture the ECR repository, runtime secret ARN, DLQ URL, ALB DNS name, and generated GitHub deployment role. Populate directional active/next HMAC keys and Access service credentials only through the guarded CLI. Apply PostgreSQL migrations as a one-off private ECS task before enabling services.
+Review and apply the saved plan. Run migrations as a private one-off ECS task, populate active/next HMAC and Access values through the guarded CLI, then enable services only after health and readiness pass.
 
 ## Production bootstrap
 
-Repeat in `infra/terraform/production` using the production account, state bucket, KMS key, certificate, and budget. Production creates two NAT gateways, a Multi-AZ RDS instance, and enables RDS/ALB deletion protection. Keep `services_enabled=false` and `AWS_ENRICHMENT_BOOTSTRAPPED=false` until:
+Repeat with `infra/terraform/production` in the production account. Production uses two NAT gateways, two API tasks, two baseline workers plus queue-depth autoscaling, Multi-AZ PostgreSQL, deletion protection, continuous recovery, and cross-account backup copies.
 
-- state locking and encryption are verified;
-- the immutable image scan passes;
-- runtime secret contains database, active/next HMAC, and Access values;
-- migrations succeed;
-- staging acceptance and backup restore evidence are complete.
+The generated GitHub deploy role is service-family scoped inside the dedicated environment account and cannot modify itself. Initial role creation or policy changes require the privileged bootstrap operator. After the protected workflow assumes the generated role successfully, remove the temporary bootstrap role.
 
-Then run `configure-aws` and `configure-enrichment`. The generated GitHub OIDC deployment role is account-scoped and intentionally powerful enough to maintain this isolated stack; review its policy before use. Remove the temporary bootstrap role after the protected workflow successfully assumes the generated role.
+Keep `services_enabled=false`, `AWS_ENRICHMENT_BOOTSTRAPPED=false`, and `PILOT_DEPLOY_ENABLED=false` until:
+
+- state encryption/locking and account-ID guards are verified;
+- immutable image scans, SBOM, and provenance pass;
+- runtime secret contains database roles, device pepper, tenant-context HMAC, active/next directional keys, Access credentials, and Play Integrity configuration;
+- all migrations complete;
+- queue alarms, budget alarms, backup copies, restore evidence, staging acceptance, and Android field acceptance pass.
 
 ## Required evidence
 
 - Terraform format, validation, security scan, speculative plan, and drift result.
-- RDS point-in-time restore to an isolated subnet and application read check.
-- ECS failed-deployment rollback and health-check evidence.
-- SQS duplicate delivery, visibility extension, DLQ movement, and guarded replay evidence.
-- Budget alarm delivery and CloudWatch log/metric visibility.
+- PostgreSQL PITR and S3 recovery into isolated infrastructure, including timestamps and application checks.
+- ECS failed-deployment rollback, queue-depth scaling, worker termination, DLQ movement, and guarded replay.
+- API, database, queue, certificate, upload-failure, and budget alarm delivery.
+- RLS direct-database and application-level two-tenant denial.
+- Account IDs, plan hashes, workflow runs, image digests, migration IDs, restore timestamps, and acceptance hashes.
 
-Never claim the AWS environment is live from repository code alone. Record account IDs, run IDs, plans, restore timestamps, and acceptance hashes in the controlled release evidence store.
+Do not infer live infrastructure, 99.5% availability, RPO, RTO, certification, or legal compliance from repository code. Those claims require recorded production evidence and contractual review.

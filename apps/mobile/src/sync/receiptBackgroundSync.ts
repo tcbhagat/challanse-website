@@ -1,7 +1,6 @@
-import BackgroundService from 'react-native-background-actions';
 import NetInfo, { NetInfoStateType } from '@react-native-community/netinfo';
 import DeviceInfo from 'react-native-device-info';
-import { Platform } from 'react-native';
+import { NativeModules, Platform } from 'react-native';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import {
@@ -25,23 +24,29 @@ import {
 import { compressReceiptBlobToWebp } from './receiptWebp';
 import { getEnrollmentCredential } from '../config/deviceEnrollment';
 import { listPendingTelemetryEvents, markTelemetryEventsSent, recordTelemetryEvent } from '../telemetry/telemetryStore';
+import { playIntegrityToken } from '../security/playIntegrity';
 
 type ReceiptSyncRuntimeGate = { allowed: boolean; reason: string; retryAfterMs: number };
 type ReceiptSyncParameters = { ingestBaseUrl?: string; wifiSsids?: string[]; siteId?: string };
 
-const TASK_NAME = 'ReceiptSync';
 const BASE_BACKOFF_MS = 5000;
 const MAX_BACKOFF_MS = 15 * 60 * 1000;
-const IDLE_POLL_MS = 45 * 1000;
 const CONSTRAINT_POLL_MS = 60 * 1000;
 const MAX_ITEMS_PER_WAKE = 5;
-const MAX_IMAGE_BYTES = 750_000;
+const MAX_IMAGE_BYTES = 5_000_000;
 const UPLOAD_PART_SIZE = 256_000;
 let isConfigured = false;
 
+type ReceiptSyncSchedulerModule = {
+  schedule(): Promise<void>;
+  cancel(): Promise<void>;
+  complete(workId: string, retry: boolean): void;
+};
+
+const ReceiptSyncScheduler = NativeModules.ReceiptSyncScheduler as ReceiptSyncSchedulerModule | undefined;
+
 NetInfo.configure({ shouldFetchWiFiSSID: true, useNativeReachability: true });
 
-function sleep(milliseconds: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
 function nowUnix(): number { return Math.floor(Date.now() / 1000); }
 function normalizeSsids(ssids: string[]): string[] { return Array.from(new Set(ssids.map((ssid) => ssid.trim().toLowerCase()).filter(Boolean))); }
 function backoff(attemptCount: number): number { return Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** Math.max(0, attemptCount)); }
@@ -85,6 +90,8 @@ async function compressedArtifact(item: ReceiptSyncQueueItem): Promise<{ bytes: 
 }
 
 async function syncReceipt(item: ReceiptSyncQueueItem, apiBaseUrl: string, token: string): Promise<void> {
+  const initialGate = await gate();
+  if (!initialGate.allowed) throw new Error(`SYNC_CONSTRAINT_${initialGate.reason.toUpperCase()}`);
   const artifact = await compressedArtifact(item);
   const imageHash = bytesToHex(sha256(artifact.bytes));
   const metadata = {
@@ -101,9 +108,15 @@ async function syncReceipt(item: ReceiptSyncQueueItem, apiBaseUrl: string, token
   const root = apiBaseUrl.replace(/\/$/, '');
   let uploadId = await getReceiptUploadId(item.receiptEventId);
   if (!uploadId) {
+    const requestNonce = nonce();
+    const integrityToken = await playIntegrityToken(imageHash);
     const sessionResponse = await fetch(`${root}/v1/uploads`, {
       method: 'POST',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      headers: {
+        Accept: 'application/json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json',
+        'X-ChallanSe-Nonce': requestNonce, 'X-ChallanSe-Device-Timestamp': String(nowUnix()),
+        ...(integrityToken ? { 'X-ChallanSe-Play-Integrity': integrityToken } : {}),
+      },
       body: JSON.stringify(metadata),
     });
     if (!sessionResponse.ok) throw new Error(`UPLOAD_SESSION_HTTP_${sessionResponse.status}`);
@@ -125,6 +138,8 @@ async function syncReceipt(item: ReceiptSyncQueueItem, apiBaseUrl: string, token
   const confirmed = new Map(progress.parts.map((part) => [part.partNumber, part.sha256]));
   await markReceiptSyncState({ receiptEventId: item.receiptEventId, status: 'uploading', detail: 'Sending confirmed image parts.' });
   for (let offset = 0, partNumber = 0; offset < artifact.bytes.byteLength; offset += UPLOAD_PART_SIZE, partNumber += 1) {
+    const partGate = await gate();
+    if (!partGate.allowed) throw new Error(`SYNC_CONSTRAINT_${partGate.reason.toUpperCase()}`);
     const part = artifact.bytes.slice(offset, Math.min(offset + UPLOAD_PART_SIZE, artifact.bytes.byteLength));
     const partHash = bytesToHex(sha256(part));
     if (confirmed.get(partNumber) === partHash) continue;
@@ -136,16 +151,21 @@ async function syncReceipt(item: ReceiptSyncQueueItem, apiBaseUrl: string, token
         'Content-Type': 'application/octet-stream',
         'X-Part-Sha256': partHash,
         'X-ChallanSe-Nonce': nonce(),
-        'X-ChallanSe-Timestamp': String(nowUnix()),
+        'X-ChallanSe-Device-Timestamp': String(nowUnix()),
       },
       body: partBuffer as unknown as RequestInit['body'],
     });
     if (!partResponse.ok) throw new Error(`UPLOAD_PART_HTTP_${partResponse.status}`);
     await updateReceiptSyncArtifactProgress(item.receiptEventId, Math.min(offset + part.byteLength, artifact.bytes.byteLength));
   }
+  const completionGate = await gate();
+  if (!completionGate.allowed) throw new Error(`SYNC_CONSTRAINT_${completionGate.reason.toUpperCase()}`);
   const response = await fetch(`${root}/v1/uploads/${uploadId}/complete`, {
     method: 'POST',
-    headers: { Accept: 'application/json', Authorization: `Bearer ${token}` },
+    headers: {
+      Accept: 'application/json', Authorization: `Bearer ${token}`,
+      'X-ChallanSe-Nonce': nonce(), 'X-ChallanSe-Device-Timestamp': String(nowUnix()),
+    },
   });
   if (!response.ok) throw new Error(`UPLOAD_COMPLETE_HTTP_${response.status}`);
   await completeReceiptSync({ receiptEventId: item.receiptEventId, uploadedBytes: artifact.bytes.byteLength, totalBytes: artifact.bytes.byteLength });
@@ -175,65 +195,68 @@ async function syncTelemetry(apiBaseUrl: string, token: string): Promise<void> {
   }
   const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/v1/mobile/telemetry`, {
     method: 'POST',
-    headers: { Accept: 'application/json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    headers: {
+      Accept: 'application/json', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json',
+      'X-ChallanSe-Nonce': nonce(), 'X-ChallanSe-Device-Timestamp': String(nowUnix()),
+    },
     body: JSON.stringify({ measurements }),
   });
   if (!response.ok) throw new Error(`TELEMETRY_HTTP_${response.status}`);
   await markTelemetryEventsSent(events.map((event) => event.id));
 }
 
-async function run(parameters?: ReceiptSyncParameters): Promise<void> {
+async function runOnce(parameters?: ReceiptSyncParameters): Promise<boolean> {
   await configure(parameters);
-  while (BackgroundService.isRunning()) {
-    const currentGate = await gate();
-    if (!currentGate.allowed) {
-      await recordReceiptSyncLog({ receiptEventId: null, state: currentGate.reason, detail: 'Sync is waiting for approved charging Wi-Fi.' });
-      await sleep(currentGate.retryAfterMs);
-      continue;
+  const currentGate = await gate();
+  if (!currentGate.allowed) {
+    await recordReceiptSyncLog({ receiptEventId: null, state: currentGate.reason, detail: 'Sync is waiting for approved charging Wi-Fi.' });
+    return true;
+  }
+  const credential = await getEnrollmentCredential();
+  if (!credential) return false;
+  await purgeAcknowledgedReceiptPayloads(7);
+  let retry = false;
+  try { await syncTelemetry(credential.apiBaseUrl, credential.deviceToken); } catch { retry = true; }
+  const items = await listPendingReceiptSyncItems(MAX_ITEMS_PER_WAKE);
+  for (const item of items) {
+    try {
+      await syncReceipt(item, credential.apiBaseUrl, credential.deviceToken);
+    } catch (caught) {
+      retry = true;
+      const detail = caught instanceof Error ? caught.message : 'UNKNOWN_UPLOAD_FAILURE';
+      const attempt = await incrementReceiptSyncAttempt({
+        receiptEventId: item.receiptEventId,
+        totalBytes: item.totalBytes,
+        uploadedBytes: 0,
+        lastError: detail,
+        nextAttemptAtUnix: nowUnix() + Math.floor(backoff(item.attemptCount) / 1000),
+      });
+      await recordReceiptSyncLog({ receiptEventId: item.receiptEventId, state: 'backoff', detail: `Attempt ${attempt}: ${detail}` });
+      await recordTelemetryEvent({ eventName: 'sync_failure_rate', siteId: item.siteId, vendorId: item.vendorId, value: 1, success: false });
     }
-    const credential = await getEnrollmentCredential();
-    if (!credential) { await sleep(CONSTRAINT_POLL_MS); continue; }
-    await purgeAcknowledgedReceiptPayloads(7);
-    try { await syncTelemetry(credential.apiBaseUrl, credential.deviceToken); } catch { /* telemetry remains queued */ }
-    const items = await listPendingReceiptSyncItems(MAX_ITEMS_PER_WAKE);
-    if (!items.length) { await sleep(IDLE_POLL_MS); continue; }
-    for (const item of items) {
-      if (!BackgroundService.isRunning()) return;
-      try {
-        await syncReceipt(item, credential.apiBaseUrl, credential.deviceToken);
-      } catch (caught) {
-        const detail = caught instanceof Error ? caught.message : 'UNKNOWN_UPLOAD_FAILURE';
-        const attempt = await incrementReceiptSyncAttempt({
-          receiptEventId: item.receiptEventId,
-          totalBytes: item.totalBytes,
-          uploadedBytes: 0,
-          lastError: detail,
-          nextAttemptAtUnix: nowUnix() + Math.floor(backoff(item.attemptCount) / 1000),
-        });
-        await recordReceiptSyncLog({ receiptEventId: item.receiptEventId, state: 'backoff', detail: `Attempt ${attempt}: ${detail}` });
-        await recordTelemetryEvent({ eventName: 'sync_failure_rate', siteId: item.siteId, vendorId: item.vendorId, value: 1, success: false });
-      }
-    }
+  }
+  const stillPending = (await listPendingReceiptSyncItems(1)).length > 0;
+  return retry || stillPending;
+}
+
+export async function runReceiptSyncWork(workId: string): Promise<void> {
+  let retry = true;
+  try {
+    retry = await runOnce();
+  } finally {
+    ReceiptSyncScheduler?.complete(workId, retry);
   }
 }
 
 export async function startReceiptBackgroundSync(parameters?: ReceiptSyncParameters): Promise<void> {
   if (Platform.OS !== 'android') return;
   await configure(parameters);
-  if (BackgroundService.isRunning()) return;
-  await BackgroundService.start(run, {
-    taskName: TASK_NAME,
-    taskTitle: 'ChallanSe receipt sync',
-    taskDesc: 'Waiting for approved charging Wi-Fi',
-    taskIcon: { name: 'ic_launcher', type: 'mipmap' },
-    color: '#0f1115',
-    foregroundServiceType: ['dataSync'],
-    parameters,
-  });
+  if (!ReceiptSyncScheduler) throw new Error('Receipt sync scheduler is unavailable.');
+  await ReceiptSyncScheduler.schedule();
 }
 
 export async function stopReceiptBackgroundSync(): Promise<void> {
-  if (Platform.OS === 'android' && BackgroundService.isRunning()) await BackgroundService.stop();
+  if (Platform.OS === 'android') await ReceiptSyncScheduler?.cancel();
 }
 
 export async function configureReceiptSyncSettings(settings: ReceiptSyncParameters): Promise<void> {

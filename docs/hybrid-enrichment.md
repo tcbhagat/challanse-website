@@ -1,16 +1,26 @@
-# Hybrid enrichment operations
+# AWS-authoritative enrichment operations
 
 ## Authority and boundaries
 
-- Cloudflare D1 is the authoritative mobile-ingestion ledger; private original WebP images remain in R2.
-- AWS Mumbai (`ap-south-1`) runs FastAPI, SQS workers, encrypted PostgreSQL, reconciliation, digest generation, and telemetry reports.
-- PostgreSQL is authoritative for enrichment and reconciliation state. Signed callbacks expose only the reviewer projection in D1.
-- Manual review and Tally CSV reconciliation are active. OCR, GST, WhatsApp, Slack, and credit providers default to `disabled` and must not be marketed as active.
-- Cloudflare storage is globally distributed. The system does not claim India-only data residency.
+- AWS Mumbai (`ap-south-1`) is authoritative for receipt images, metadata, reviewer state, devices, OCR, reconciliation, audit, retention, and exports.
+- Original WebP images are private S3 objects encrypted with SSE-KMS and scoped by organization/site prefixes.
+- RDS PostgreSQL is the system of record and enforces `organization_id` RLS on tenant tables.
+- Cloudflare is stateless DNS, WAF, Access, Turnstile, replay control, and routing. It stores no receipt payloads.
+- Textract OCR is active. GST, credit, WhatsApp, Slack, and individual notifications remain disabled.
+
+## Ingestion contract
+
+1. `POST /v1/uploads` creates an idempotent device-, organization-, site-, receipt-, and checksum-scoped session.
+2. `PUT /v1/uploads/{id}/parts/{number}` stores a validated 256 KB part with the expected offset and SHA-256.
+3. `GET /v1/uploads/{id}` returns confirmed parts and the next required offset.
+4. `POST /v1/uploads/{id}/complete` assembles and validates WebP bytes, writes the final S3 object, and commits receipt, quota, workflow, and outbox state.
+5. The API returns `202 RECEIVED` only after final S3 and PostgreSQL durability.
+
+All mutating operations require device identity, tenant/site scope, timestamp, nonce, receipt UUID, and integrity metadata. Conditional counters prevent concurrent quota overruns. Lifecycle jobs delete orphaned parts and final objects left by failed completions.
 
 ## Request security
 
-Every Cloudflare-to-AWS and AWS-to-Cloudflare request includes:
+Service requests require Cloudflare service authentication plus directional HMAC headers:
 
 - `X-ChallanSe-Key-Id`
 - `X-ChallanSe-Timestamp`
@@ -18,43 +28,44 @@ Every Cloudflare-to-AWS and AWS-to-Cloudflare request includes:
 - `X-ChallanSe-Content-SHA256`
 - `X-ChallanSe-Signature`
 
-The canonical value is the newline-joined timestamp, request ID, key ID, uppercase method, path, and body SHA-256. Receivers reject invalid digests, signatures, timestamps older than 60 seconds, unknown key IDs, and replayed request IDs. Cloudflare Access service credentials are required in addition to HMAC.
-
-Each direction has active and next keys. Rotation is two-phase:
+Receivers reject unknown key IDs, bad body digests, stale timestamps, invalid signatures, and replayed request IDs. Active and next keys rotate in two phases:
 
 ```bash
 ./scripts/go-live.sh rotate-enrichment-keys stage
-# Deploy and verify both sides accept the staged next keys.
+# Deploy and verify both sides accept active and next keys.
 ./scripts/go-live.sh rotate-enrichment-keys promote
-# Deploy and verify again. The prior active key remains the overlap key.
+# Deploy and verify again before retiring the overlap key.
 ```
-
-Never skip the deployment and verification between phases.
 
 ## Durable processing
 
-`POST /v1/events/receipts` validates authentication, reserves the request ID and receipt UUID in PostgreSQL, and returns `202` only after SQS accepts the event. Duplicate requests return the existing ingress result. The SQS worker uses long polling, extends visibility while processing, and deletes a message only after the PostgreSQL transaction and Cloudflare callback succeed. Stage uniqueness and a transactional outbox make duplicate SQS delivery safe.
+- Unique `(receipt_id, stage)` records isolate `IMAGE_FETCH`, `OCR`, `GST`, `EDGE_CALLBACK`, and `CREDIT_DELIVERY`.
+- OCR and GST adapters are side-effect free and return results plus proposed events.
+- Enrichment state, encrypted audit values, workflow state, and outbox events commit in one PostgreSQL transaction.
+- Outbox delivery uses leases, exponential retry, unique `(event_id, destination)` keys, terminal failure status, and guarded DLQ replay.
+- SQS messages are deleted only after committed processing; at-least-once delivery cannot duplicate provider stages.
+- Callback failure retries only the callback event and never repeats OCR or GST.
 
-The worker fetches the private image through the signed Cloudflare endpoint, verifies size and SHA-256, confirms WebP content, converts it to PNG in memory, and then invokes the selected OCR adapter. Confidence below 60 percent or provider failure becomes `NEEDS_HUMAN_REVIEW`.
+The worker fetches the S3 object, verifies its tenant path, S3 metadata, content type, size, and SHA-256, converts WebP to PNG in memory, and invokes Textract. Confidence below 60 percent or provider failure routes the receipt to `NEEDS_HUMAN_REVIEW`.
 
-## Provider activation
+## Provider policy
 
-| Provider | Production default | Activation gate |
+| Provider | Production state | Activation requirement |
 | --- | --- | --- |
-| Textract | `disabled` | Approved AWS permissions, cost budget, redaction review, timeout and low-confidence tests |
-| GST | `disabled` | Legal approval, real endpoint credentials, 3-second timeout tests, encrypted statutory fields |
-| Credit queue | `disabled` | GST verified, banking/legal approval, exact `AA_1.0.0` contract acceptance |
-| WhatsApp | `disabled` | Business account and approved four-hour digest template |
-| Slack | `disabled` | Approved webhook and redaction review |
+| Textract | Active | AWS permissions, budget, redaction, timeout, confidence, and fallback tests |
+| GST | Disabled | Legal approval, real credentials, encrypted statutory fields, 3-second timeout and ±2% tests |
+| Credit | Disabled | GST approval, banking/legal approval, FIFO contract acceptance |
+| WhatsApp | Disabled | Business account and approved grouped-digest template |
+| Slack | Disabled | Approved endpoint and redaction review |
 
-Mock providers are forbidden when `ENVIRONMENT=production`. GST mismatch or failure never emits a credit message.
+Mock providers are forbidden in production. GST mismatch, failure, or disabled state never emits credit data.
 
-## Failure recovery
+## Recovery and retention
 
-- SQS moves a message to the DLQ after five receives; messages are retained for 14 days.
-- Replay is guarded and rate-limited to one message per second: `./scripts/go-live.sh replay-dlq`.
-- ECS uses deployment circuit breakers and automatic rollback.
-- Production RDS is Multi-AZ with seven-day automated backups and deletion protection. Restore evidence is required before release.
-- Ninety-day image and one-year receipt/audit retention use tombstones across D1, R2, and PostgreSQL.
+- SQS moves a message to the DLQ after five receives and retains it for 14 days.
+- Queue depth scales workers; queue age and DLQ alarms notify operators.
+- Production RDS uses Multi-AZ, 14-day automated PITR, deletion protection, and daily cross-account recovery copies retained 35 days.
+- Live S3 image versions are removed after 90 days by a PostgreSQL-driven, version-aware tombstone workflow; receipt/audit records are removed after one year.
+- Recovery backups can retain encrypted historical copies beyond live retention. Access is restricted to recovery operators and expiry follows the documented backup schedule. This exception requires client disclosure and independent privacy review.
 
-See `docs/aws-bootstrap.md` for account provisioning and `docs/pilot-runbook.md` for release acceptance.
+The service target is 99.5% availability, RPO no greater than one hour, and RTO no greater than eight hours only after monitoring and restore evidence pass. No 24×7 support or certification is claimed.

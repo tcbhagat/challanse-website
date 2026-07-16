@@ -1,10 +1,12 @@
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 
 from .config import Settings
-from .providers import CreditQueue, GstResult, fetch_gst
+from .providers import GstResult, fetch_gst
 from .schemas import AAFIData, GstReceiptContext
 
 
@@ -30,21 +32,26 @@ def build_aafi(context: GstReceiptContext, result: GstResult) -> AAFIData:
     )
 
 
+@dataclass(frozen=True)
+class GstValidation:
+    status: str
+    audit: dict[str, object]
+    credit_payload: dict[str, Any] | None = None
+
+
 def validate_gst(
     settings: Settings,
     context: GstReceiptContext,
-    credit_queue: CreditQueue,
     client: httpx.Client | None = None,
-) -> tuple[str, dict[str, object]]:
+) -> GstValidation:
     if not context.vendor_gst_number or not context.developer_gst_number or context.site_captured_quantity is None:
-        return "NEEDS_HUMAN_REVIEW", {}
+        return GstValidation("NEEDS_HUMAN_REVIEW", {})
     try:
         result = fetch_gst(settings, context.vendor_gst_number, context.timestamp_unix, client)
     except Exception:
-        return "NEEDS_HUMAN_REVIEW", {}
+        return GstValidation("NEEDS_HUMAN_REVIEW", {})
     audit = {"irn_hash": result.irn_hash, "e_invoice_quantity": result.e_invoice_quantity}
     if not quantities_match(context.site_captured_quantity, result.e_invoice_quantity):
-        return "GST_ANOMALY", audit
+        return GstValidation("GST_ANOMALY", audit)
     payload = build_aafi(context, result)
-    credit_queue.enqueue(payload.model_dump(mode="json"))
-    return "VERIFIED_GST", audit
+    return GstValidation("VERIFIED_GST", audit, payload.model_dump(mode="json"))

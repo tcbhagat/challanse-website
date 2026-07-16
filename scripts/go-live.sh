@@ -65,7 +65,13 @@ cf() {
       printf '%s\n' 'After the dashboard shows constrovet.com, rerun dns-onboard. Do not change Namecheap nameservers yet.' >&2
     fi
     if [[ "$path" == *'/rulesets'* ]]; then
-      printf '%s\n' 'The token must include Zone > Dynamic URL Redirects > Edit for constrovet.com so the approved app redirect can be created.' >&2
+      if [[ "$path" == "/accounts/"*'/rulesets'* ]]; then
+        printf '%s\n' 'The token must include Account > Account Rulesets > Read (or Account WAF Read) so the Free Managed Ruleset can be resolved without broad account access.' >&2
+      elif [[ "$path" == *'http_request_firewall_managed'* ]]; then
+        printf '%s\n' 'The token must include Zone > WAF > Edit for constrovet.com so the Cloudflare Free Managed Ruleset can be enforced.' >&2
+      else
+        printf '%s\n' 'The token must include Zone > Dynamic URL Redirects > Edit and Zone > WAF > Edit for constrovet.com.' >&2
+      fi
     fi
     die "Cloudflare API request failed: $method $path"
   fi
@@ -169,6 +175,54 @@ ensure_app_redirect_rule() {
   printf 'App redirect rule already correct.\n'
 }
 
+free_managed_waf_ids() {
+  local managed_rulesets free_ruleset_id zone_rulesets entrypoint_id details execute_rule_id
+  managed_rulesets="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/rulesets?per_page=100")"
+  free_ruleset_id="$(jq -r '.result[]? | select(.name == "Cloudflare Free Managed Ruleset") | .id' <<<"$managed_rulesets" | head -1)"
+  [[ -n "$free_ruleset_id" ]] || die "Cloudflare Free Managed Ruleset is unavailable for this account. Nothing was changed."
+  zone_rulesets="$(cf GET "/zones/$ZONE_ID/rulesets")"
+  entrypoint_id="$(jq -r '.result[]? | select(.kind == "zone" and .phase == "http_request_firewall_managed") | .id' <<<"$zone_rulesets" | head -1)"
+  execute_rule_id=""
+  if [[ -n "$entrypoint_id" ]]; then
+    details="$(cf GET "/zones/$ZONE_ID/rulesets/$entrypoint_id")"
+    execute_rule_id="$(jq -r --arg managed "$free_ruleset_id" '.result.rules[]? | select(.action == "execute" and .enabled == true and .expression == "true" and .action_parameters.id == $managed) | .id' <<<"$details" | head -1)"
+  fi
+  printf '%s|%s|%s' "$free_ruleset_id" "$entrypoint_id" "$execute_rule_id"
+}
+
+ensure_free_managed_waf() {
+  local ids free_ruleset_id entrypoint_id execute_rule_id rule body created
+  ids="$(free_managed_waf_ids)"
+  IFS='|' read -r free_ruleset_id entrypoint_id execute_rule_id <<<"$ids"
+  if [[ -n "$execute_rule_id" ]]; then
+    printf '%s\n' 'Cloudflare Free Managed Ruleset is already enabled.'
+  else
+    rule="$(jq -nc --arg ruleset_id "$free_ruleset_id" '{action:"execute",action_parameters:{id:$ruleset_id},expression:"true",description:"ChallanSe Cloudflare Free Managed Ruleset",enabled:true}')"
+    if [[ -z "$entrypoint_id" ]]; then
+      body="$(jq -nc --argjson rule "$rule" '{name:"ChallanSe managed WAF",description:"Zone-level managed WAF entry point",kind:"zone",phase:"http_request_firewall_managed",rules:[$rule]}')"
+      created="$(cf POST "/zones/$ZONE_ID/rulesets" "$body")"
+      entrypoint_id="$(jq -r '.result.id // empty' <<<"$created")"
+      execute_rule_id="$(jq -r '.result.rules[]? | select(.description == "ChallanSe Cloudflare Free Managed Ruleset") | .id' <<<"$created" | head -1)"
+    else
+      created="$(cf POST "/zones/$ZONE_ID/rulesets/$entrypoint_id/rules" "$rule")"
+      execute_rule_id="$(jq -r '.result.rules[]? | select(.description == "ChallanSe Cloudflare Free Managed Ruleset") | .id' <<<"$created" | head -1)"
+    fi
+    [[ -n "$entrypoint_id" && -n "$execute_rule_id" ]] || die "Cloudflare created an incomplete WAF configuration. Review the zone before continuing."
+    printf '%s\n' 'Enabled the Cloudflare Free Managed Ruleset for constrovet.com.'
+  fi
+  save_state CLOUDFLARE_FREE_WAF_RULESET_ID "$free_ruleset_id"
+  save_state CLOUDFLARE_FREE_WAF_ENTRYPOINT_ID "$entrypoint_id"
+  save_state CLOUDFLARE_FREE_WAF_EXECUTE_RULE_ID "$execute_rule_id"
+  gh variable set CLOUDFLARE_FREE_WAF_ENABLED --repo "$REPO" --env production --body true
+}
+
+assert_free_managed_waf() {
+  local ids free_ruleset_id entrypoint_id execute_rule_id
+  ids="$(free_managed_waf_ids)"
+  IFS='|' read -r free_ruleset_id entrypoint_id execute_rule_id <<<"$ids"
+  [[ -n "$free_ruleset_id" && -n "$entrypoint_id" && -n "$execute_rule_id" ]] || die "Cloudflare Free Managed Ruleset is not enabled. Rerun: ./scripts/go-live.sh provision"
+}
+
 dns_onboard() {
   for command in jq curl git; do need "$command"; done
   [[ -z "$(git status --porcelain)" ]] || die "Git working tree is not clean."
@@ -265,14 +319,10 @@ latest_ci_success() {
   sha="$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --branch main --limit 1 --json headSha --jq '.[0].headSha')"
   [[ "$conclusion" == "success" && "$sha" == "$(git rev-parse HEAD)" ]] || die "Latest main CI for the current commit is not successful."
 }
-resource_id() {
-  local json="$1" name="$2"
-  jq -r --arg name "$name" '.. | objects | select((.name? == $name) or (.queue_name? == $name)) | .uuid? // .id? // empty' <<<"$json" | head -1
-}
 render_edge_config() {
   load_state
-  [[ -n "${D1_DATABASE_ID:-}" && -n "${ACCESS_TEAM_DOMAIN:-}" && -n "${ACCESS_AUD:-}" ]] || die "Provisioning state is incomplete."
-  CLOUDFLARE_D1_DATABASE_ID="$D1_DATABASE_ID" CLOUDFLARE_ACCESS_TEAM_DOMAIN="$ACCESS_TEAM_DOMAIN" CLOUDFLARE_ACCESS_AUD="$ACCESS_AUD" node scripts/render-edge-config.mjs >/dev/null
+  [[ -n "${ACCESS_TEAM_DOMAIN:-}" && -n "${ACCESS_AUD:-}" ]] || die "Provisioning state is incomplete."
+  CLOUDFLARE_ACCESS_TEAM_DOMAIN="$ACCESS_TEAM_DOMAIN" CLOUDFLARE_ACCESS_AUD="$ACCESS_AUD" node scripts/render-edge-config.mjs >/dev/null
 }
 
 preflight() {
@@ -286,42 +336,6 @@ preflight() {
   load_state
   [[ -n "${DNS_ACCEPTED_AT:-}" && "${DNS_ACCEPTED_ZONE_ID:-}" == "$ZONE_ID" ]] || die "Run dns-status and dns-accept after website, app, and email checks pass."
   printf 'Preflight passed for %s. Production deployment remains disabled.\n' "$REPO"
-}
-
-ensure_wrangler_resource() {
-  local kind="$1" name="$2" list id body
-  case "$kind" in
-    d1)
-      list="$(wrangler d1 list --json)"
-      id="$(resource_id "$list" "$name")"
-      if [[ -z "$id" ]]; then wrangler d1 create "$name" >/dev/null; list="$(wrangler d1 list --json)"; id="$(resource_id "$list" "$name")"; fi
-      [[ -n "$id" ]] || die "D1 database was not created: $name"
-      printf '%s' "$id"
-      return
-      ;;
-    r2)
-      list="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")"
-      if ! jq -e --arg name "$name" '.. | objects | select(.name? == $name)' >/dev/null <<<"$list"; then
-        cf PUT "/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets/$name" '{}' >/dev/null
-      fi
-      ;;
-    queue)
-      list="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/queues")"
-      if ! jq -e --arg name "$name" '.. | objects | select(.queue_name? == $name)' >/dev/null <<<"$list"; then
-        body="$(jq -nc --arg name "$name" '{queue_name:$name}')"
-        cf POST "/accounts/$CLOUDFLARE_ACCOUNT_ID/queues" "$body" >/dev/null
-      fi
-      ;;
-    *) die "Unknown resource kind: $kind" ;;
-  esac
-  if [[ "$kind" == "r2" ]]; then
-    list="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/r2/buckets")"
-    jq -e --arg name "$name" '.. | objects | select(.name? == $name)' >/dev/null <<<"$list" || die "R2 bucket was not created: $name"
-  else
-    list="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/queues")"
-    jq -e --arg name "$name" '.. | objects | select(.queue_name? == $name)' >/dev/null <<<"$list" || die "Queue was not created: $name"
-  fi
-  printf '%s' "$name"
 }
 
 snapshot_dns() {
@@ -417,12 +431,6 @@ provision() {
   prompt_value REVIEWER_EMAIL_2 "Second reviewer email"
   [[ "$REVIEWER_EMAIL_1" != "$REVIEWER_EMAIL_2" ]] || die "Reviewer emails must be different."
   snapshot_dns
-  D1_DATABASE_ID="$(ensure_wrangler_resource d1 challanse-pilot)"
-  ensure_wrangler_resource r2 challanse-receipts >/dev/null
-  ensure_wrangler_resource queue challanse-receipts >/dev/null
-  ensure_wrangler_resource queue challanse-receipts-dlq >/dev/null
-  save_state D1_DATABASE_ID "$D1_DATABASE_ID"
-
   local widgets widget turnstile_sitekey turnstile_secret organization access_domain apps app access_aud body email_rules
   widgets="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/challenges/widgets?filter=name:ChallanSe%20pilot&per_page=50")"
   widget="$(jq -c '.result[]? | select(.name == "ChallanSe pilot")' <<<"$widgets" | head -1)"
@@ -450,7 +458,9 @@ provision() {
     app="$(cf POST "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps" "$body" | jq -c '.result')"
   else
     app="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$(jq -r .id <<<"$app")" | jq -c '.result')"
-    jq -e --arg first "$REVIEWER_EMAIL_1" --arg second "$REVIEWER_EMAIL_2" '[.. | .email? | strings] | index($first) != null and index($second) != null' >/dev/null <<<"$app" || die "Existing Access app does not contain both supplied reviewers. Update it explicitly before continuing."
+    if ! jq -e '(.allowed_idps | length) == 1 and .auto_redirect_to_identity == true and .mfa_config.mfa_disabled == false' >/dev/null <<<"$app"; then
+      jq -e --arg first "$REVIEWER_EMAIL_1" --arg second "$REVIEWER_EMAIL_2" '[.. | .email? | strings] | index($first) != null and index($second) != null' >/dev/null <<<"$app" || die "Existing Access app is neither enterprise-OIDC/MFA hardened nor limited to both supplied pre-launch reviewers."
+    fi
   fi
   access_aud="$(jq -r '.aud // empty' <<<"$app")"
   [[ -n "$access_aud" ]] || die "Access audience was not returned."
@@ -460,11 +470,11 @@ provision() {
   save_state REVIEWER_EMAIL_1 "$REVIEWER_EMAIL_1"
   save_state REVIEWER_EMAIL_2 "$REVIEWER_EMAIL_2"
 
-  gh variable set CLOUDFLARE_D1_DATABASE_ID --repo "$REPO" --env production --body "$D1_DATABASE_ID"
   gh variable set CLOUDFLARE_ACCESS_TEAM_DOMAIN --repo "$REPO" --env production --body "$access_domain"
   gh variable set CLOUDFLARE_ACCESS_AUD --repo "$REPO" --env production --body "$access_aud"
   gh variable set TURNSTILE_SITE_KEY --repo "$REPO" --env production --body "$turnstile_sitekey"
   ensure_landing_dns
+  ensure_free_managed_waf
   if gh api "repos/$REPO/pages" >/dev/null 2>&1; then
     gh api --method PUT "repos/$REPO/pages" -f cname=challanse.constrovet.com -f build_type=workflow >/dev/null
   else
@@ -472,14 +482,50 @@ provision() {
     gh api --method PUT "repos/$REPO/pages" -f cname=challanse.constrovet.com -f build_type=workflow >/dev/null
   fi
   unset turnstile_secret CLOUDFLARE_API_TOKEN
-  printf 'Cloudflare resources, Access, Turnstile, DNS, and GitHub variables are provisioned. Deployment remains disabled.\n'
+  printf 'Stateless Cloudflare routing, Access, Turnstile, DNS, and GitHub variables are provisioned. AWS remains authoritative and deployment remains disabled.\n'
+}
+
+configure_identity() {
+  preflight
+  local identity_provider_id providers provider_type apps app app_id policies policy policy_id app_body policy_body verified
+  read -r -p 'Cloudflare enterprise OIDC identity-provider UUID: ' identity_provider_id
+  [[ "$identity_provider_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Identity-provider ID must be a UUID from Zero Trust > Settings > Authentication > Login methods."
+  providers="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/identity_providers?per_page=100")"
+  provider_type="$(jq -r --arg id "$identity_provider_id" '.result[]? | select(.id == $id) | .type // empty' <<<"$providers")"
+  [[ "$provider_type" == "oidc" ]] || die "The selected login method is not a generic enterprise OIDC provider: ${provider_type:-not found}."
+
+  apps="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps")"
+  app="$(jq -c '.result[]? | select(.name == "ChallanSe reviewers")' <<<"$apps" | head -1)"
+  [[ -n "$app" ]] || die "Run provision before configuring enterprise identity."
+  app_id="$(jq -r '.id' <<<"$app")"
+  app_body="$(jq -nc --arg idp "$identity_provider_id" '{name:"ChallanSe reviewers",type:"self_hosted",destinations:[{type:"public",uri:"review.challanse.constrovet.com"}],session_duration:"8h",app_launcher_visible:false,allow_authenticate_via_warp:false,allowed_idps:[$idp],auto_redirect_to_identity:true,mfa_config:{mfa_disabled:false,session_duration:"8h",allowed_authenticators:["totp","security_key","biometrics"]}}')"
+  cf PUT "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$app_id" "$app_body" >/dev/null
+
+  policies="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$app_id/policies")"
+  policy="$(jq -c '.result[]? | select(.name == "Approved ChallanSe reviewers")' <<<"$policies" | head -1)"
+  [[ -n "$policy" ]] || die "The ChallanSe reviewer Access policy was not found."
+  policy_id="$(jq -r '.id' <<<"$policy")"
+  policy_body="$(jq -nc --arg idp "$identity_provider_id" '{name:"Approved ChallanSe reviewers",decision:"allow",precedence:1,include:[{everyone:{}}],require:[{login_method:{id:$idp}},{auth_method:{auth_method:"mfa"}}],session_duration:"8h",mfa_config:{mfa_disabled:false,session_duration:"8h",allowed_authenticators:["totp","security_key","biometrics"]}}')"
+  cf PUT "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$app_id/policies/$policy_id" "$policy_body" >/dev/null
+
+  verified="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$app_id")"
+  jq -e --arg idp "$identity_provider_id" '.result.allowed_idps == [$idp] and .result.auto_redirect_to_identity == true and .result.mfa_config.mfa_disabled == false' >/dev/null <<<"$verified" || die "Cloudflare did not retain the OIDC and MFA application settings."
+  verified="$(cf GET "/accounts/$CLOUDFLARE_ACCOUNT_ID/access/apps/$app_id/policies/$policy_id")"
+  jq -e --arg idp "$identity_provider_id" '([.result.require[]?.login_method.id] | index($idp) != null) and ([.result.require[]?.auth_method.auth_method] | index("mfa") != null) and .result.mfa_config.mfa_disabled == false' >/dev/null <<<"$verified" || die "Cloudflare did not retain the OIDC and MFA policy requirements."
+
+  save_state ACCESS_IDENTITY_PROVIDER_ID "$identity_provider_id"
+  save_state ACCESS_MFA_ENFORCED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  gh variable set ACCESS_IDENTITY_PROVIDER_ID --repo "$REPO" --env production --body "$identity_provider_id"
+  gh variable set ACCESS_MFA_ENFORCED --repo "$REPO" --env production --body true
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  printf '%s\n' 'Reviewer Access now permits only the selected enterprise OIDC provider and requires MFA; database membership remains the final authorization check.'
 }
 
 configure_github() {
   preflight
   command -v keytool >/dev/null 2>&1 || die "keytool is required only for Android signing. On Ubuntu run: sudo apt update && sudo apt install -y openjdk-17-jdk-headless"
   load_state
-  [[ -n "${D1_DATABASE_ID:-}" && -n "${ACCESS_AUD:-}" && -n "${TURNSTILE_SITE_KEY:-}" ]] || die "Run provision first."
+  [[ -n "${ACCESS_AUD:-}" && -n "${TURNSTILE_SITE_KEY:-}" ]] || die "Run provision first."
   prompt_secret CLOUDFLARE_API_TOKEN "Cloudflare API token"
   printf '%s' "$CLOUDFLARE_API_TOKEN" | gh secret set CLOUDFLARE_API_TOKEN --repo "$REPO" --env production
   printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | gh secret set CLOUDFLARE_ACCOUNT_ID --repo "$REPO" --env production
@@ -488,7 +534,7 @@ configure_github() {
   if [[ -n "$pepper" ]]; then
     printf '%s' "$pepper" | gh secret set DEVICE_TOKEN_PEPPER --repo "$REPO" --env production
   fi
-  existing_fingerprint="$(github_environment_variable CHALLANSE_SIGNING_CERT_SHA256)"
+  existing_fingerprint="$(github_environment_variable CHALLANSE_UPLOAD_CERT_SHA256)"
   load_state
   if [[ -n "$existing_fingerprint" && -n "${SIGNING_CERT_SHA256:-}" && "$existing_fingerprint" == "$SIGNING_CERT_SHA256" ]]; then
     printf 'Existing Android signing identity retained: %s\n' "$existing_fingerprint"
@@ -498,7 +544,7 @@ configure_github() {
     return
   fi
   if github_environment_secret_exists CHALLANSE_KEYSTORE_BASE64; then
-    printf '%s\n' 'Existing signing secrets have no trusted local fingerprint. No production APK has been released, so rotate them before launch.'
+    printf '%s\n' 'Existing upload-key secrets have no trusted local fingerprint. No Play release has been published, so rotate them before launch.'
     read -r -p 'Type ROTATE SIGNING to create a fresh pre-release identity: ' answer
     [[ "$answer" == "ROTATE SIGNING" ]] || die "Signing rotation cancelled; GitHub secrets were unchanged."
   fi
@@ -519,7 +565,7 @@ configure_github() {
   printf '%s' "$password" | gh secret set CHALLANSE_KEYSTORE_PASSWORD --repo "$REPO" --env production
   printf '%s' challanse | gh secret set CHALLANSE_KEY_ALIAS --repo "$REPO" --env production
   printf '%s' "$password" | gh secret set CHALLANSE_KEY_PASSWORD --repo "$REPO" --env production
-  gh variable set CHALLANSE_SIGNING_CERT_SHA256 --repo "$REPO" --env production --body "$fingerprint"
+  gh variable set CHALLANSE_UPLOAD_CERT_SHA256 --repo "$REPO" --env production --body "$fingerprint"
   save_state SIGNING_KEYSTORE_PATH "$keystore"
   save_state SIGNING_CERT_SHA256 "$fingerprint"
   gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
@@ -530,7 +576,7 @@ configure_github() {
 configure_enrichment() {
   preflight
   need aws
-  local enrichment_url access_client_id access_client_secret edge_key edge_next_key service_key service_next_key edge_key_id edge_next_key_id service_key_id service_next_key_id runtime_secret_arn runtime_json updated_runtime timestamp
+  local enrichment_url access_client_id access_client_secret tunnel_token device_pepper pepper_confirmation play_credentials_file play_credentials_json tenant_context_key edge_key edge_next_key service_key service_next_key edge_key_id edge_next_key_id service_key_id service_next_key_id runtime_secret_arn runtime_json updated_runtime timestamp
   if github_environment_secret_exists EDGE_TO_ENRICHMENT_HMAC_KEY || github_environment_secret_exists EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY || github_environment_secret_exists ENRICHMENT_TO_EDGE_HMAC_KEY || github_environment_secret_exists ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY; then
     die "Directional enrichment keys already exist. Use the documented dual-key rotation procedure; configure-enrichment never replaces active keys."
   fi
@@ -539,10 +585,21 @@ configure_enrichment() {
   [[ "$enrichment_url" =~ ^https://[A-Za-z0-9.-]+$ ]] || die "Enrichment URL must be an HTTPS origin without a path."
   prompt_secret ENRICHMENT_ACCESS_CLIENT_ID "Cloudflare Access service-token client ID"
   prompt_secret ENRICHMENT_ACCESS_CLIENT_SECRET "Cloudflare Access service-token client secret"
+  prompt_secret CLOUDFLARE_TUNNEL_TOKEN "Cloudflare Tunnel connector token"
+  read -r -p 'Play Integrity Google credential JSON file (service_account or external_account): ' play_credentials_file
+  play_credentials_file="$(realpath -e "$play_credentials_file")"
+  [[ -f "$play_credentials_file" && "$play_credentials_file" != "$ROOT"/* ]] || die "Play Integrity credentials must be an existing JSON file outside this repository."
+  jq -e '(.type == "service_account" and (.client_email | type == "string") and (.private_key | type == "string")) or (.type == "external_account" and (.audience | type == "string"))' >/dev/null "$play_credentials_file" || die "Play Integrity credentials must be a valid service_account or external_account configuration."
+  play_credentials_json="$(jq -c . "$play_credentials_file")"
   prompt_value AWS_RUNTIME_SECRET_ARN "AWS enrichment runtime secret ARN"
   prompt_value AWS_DEAD_LETTER_QUEUE_URL "AWS receipt dead-letter queue URL"
   access_client_id="$ENRICHMENT_ACCESS_CLIENT_ID"
   access_client_secret="$ENRICHMENT_ACCESS_CLIENT_SECRET"
+  tunnel_token="$CLOUDFLARE_TUNNEL_TOKEN"
+  printf '%s\n' 'The original device pepper cannot be read back from GitHub. No production devices may exist at this pre-launch step.'
+  read -r -p 'Type ROTATE UNUSED DEVICE PEPPER to create one authoritative value for AWS and GitHub: ' pepper_confirmation
+  [[ "$pepper_confirmation" == "ROTATE UNUSED DEVICE PEPPER" ]] || die "Device pepper initialization cancelled."
+  device_pepper="$(openssl rand -hex 32)"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
   edge_key="$(openssl rand -hex 32)"
   edge_next_key="$(openssl rand -hex 32)"
@@ -554,15 +611,20 @@ configure_enrichment() {
   service_next_key_id="service-${timestamp}-next"
   runtime_secret_arn="$AWS_RUNTIME_SECRET_ARN"
   runtime_json="$(aws secretsmanager get-secret-value --secret-id "$runtime_secret_arn" --query SecretString --output text)"
-  jq -e '.DATABASE_URL | type == "string" and length > 0' >/dev/null <<<"$runtime_json" || die "AWS runtime secret does not contain the Terraform-created DATABASE_URL."
+  jq -e '(.DATABASE_URL | type == "string" and length > 0) and (.SYSTEM_DATABASE_URL | type == "string" and length > 0)' >/dev/null <<<"$runtime_json" || die "AWS runtime secret does not contain the Terraform-created app and system database URLs."
+  tenant_context_key="$(jq -r '.TENANT_CONTEXT_HMAC_KEY // empty' <<<"$runtime_json")"
+  if [[ ! "$tenant_context_key" =~ ^[a-f0-9]{64,}$ ]]; then
+    tenant_context_key="$(openssl rand -hex 32)"
+  fi
   updated_runtime="$(jq -c \
-    --arg cloudflare_api_url https://api.challanse.constrovet.com \
     --arg edge_key_id "$edge_key_id" --arg edge_key "$edge_key" \
     --arg edge_next_key_id "$edge_next_key_id" --arg edge_next_key "$edge_next_key" \
     --arg service_key_id "$service_key_id" --arg service_key "$service_key" \
     --arg service_next_key_id "$service_next_key_id" --arg service_next_key "$service_next_key" \
     --arg access_id "$access_client_id" --arg access_secret "$access_client_secret" \
-    '. + {CLOUDFLARE_API_URL:$cloudflare_api_url,EDGE_TO_ENRICHMENT_HMAC_KEY_ID:$edge_key_id,EDGE_TO_ENRICHMENT_HMAC_KEY:$edge_key,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID:$edge_next_key_id,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY:$edge_next_key,ENRICHMENT_TO_EDGE_HMAC_KEY_ID:$service_key_id,ENRICHMENT_TO_EDGE_HMAC_KEY:$service_key,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID:$service_next_key_id,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY:$service_next_key,CLOUDFLARE_ACCESS_CLIENT_ID:$access_id,CLOUDFLARE_ACCESS_CLIENT_SECRET:$access_secret}' <<<"$runtime_json")"
+    --arg tunnel_token "$tunnel_token" --arg device_pepper "$device_pepper" --arg tenant_context_key "$tenant_context_key" \
+    --argjson play_credentials "$play_credentials_json" \
+    '. + {EDGE_TO_ENRICHMENT_HMAC_KEY_ID:$edge_key_id,EDGE_TO_ENRICHMENT_HMAC_KEY:$edge_key,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID:$edge_next_key_id,EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY:$edge_next_key,ENRICHMENT_TO_EDGE_HMAC_KEY_ID:$service_key_id,ENRICHMENT_TO_EDGE_HMAC_KEY:$service_key,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID:$service_next_key_id,ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY:$service_next_key,CLOUDFLARE_ACCESS_CLIENT_ID:$access_id,CLOUDFLARE_ACCESS_CLIENT_SECRET:$access_secret,CLOUDFLARE_TUNNEL_TOKEN:$tunnel_token,DEVICE_TOKEN_PEPPER:$device_pepper,TENANT_CONTEXT_HMAC_KEY:$tenant_context_key,PLAY_INTEGRITY_CREDENTIALS_JSON:($play_credentials|tojson)}' <<<"$runtime_json")"
   aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string "$updated_runtime" >/dev/null
   printf '%s' "$edge_key" | gh secret set EDGE_TO_ENRICHMENT_HMAC_KEY --repo "$REPO" --env production
   printf '%s' "$edge_next_key" | gh secret set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY --repo "$REPO" --env production
@@ -570,6 +632,7 @@ configure_enrichment() {
   printf '%s' "$service_next_key" | gh secret set ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY --repo "$REPO" --env production
   printf '%s' "$access_client_id" | gh secret set ENRICHMENT_ACCESS_CLIENT_ID --repo "$REPO" --env production
   printf '%s' "$access_client_secret" | gh secret set ENRICHMENT_ACCESS_CLIENT_SECRET --repo "$REPO" --env production
+  printf '%s' "$device_pepper" | gh secret set DEVICE_TOKEN_PEPPER --repo "$REPO" --env production
   gh variable set ENRICHMENT_URL --repo "$REPO" --env production --body "$enrichment_url"
   gh variable set EDGE_TO_ENRICHMENT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_key_id"
   gh variable set EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID --repo "$REPO" --env production --body "$edge_next_key_id"
@@ -582,9 +645,176 @@ configure_enrichment() {
   save_state EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID "$edge_next_key_id"
   save_state ENRICHMENT_TO_EDGE_HMAC_KEY_ID "$service_key_id"
   save_state ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID "$service_next_key_id"
-  unset edge_key edge_next_key service_key service_next_key access_client_id access_client_secret runtime_json updated_runtime ENRICHMENT_ACCESS_CLIENT_SECRET
+  unset edge_key edge_next_key service_key service_next_key access_client_id access_client_secret tunnel_token device_pepper tenant_context_key play_credentials_json runtime_json updated_runtime ENRICHMENT_ACCESS_CLIENT_SECRET CLOUDFLARE_TUNNEL_TOKEN
   gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
   printf '%s\n' 'Directional HMAC keys and Access service credentials were sent directly to GitHub and AWS Secrets Manager; they were not saved locally.'
+}
+
+configure_play() {
+  preflight
+  local service_account_file organization_ids_file play_fingerprint upload_fingerprint cloud_project_number confirmation organization_ids_canonical organization_ids_sha256 organization_ids_count
+  upload_fingerprint="$(github_environment_variable CHALLANSE_UPLOAD_CERT_SHA256)"
+  [[ "$upload_fingerprint" =~ ^[0-9A-F]{64}$ ]] || die "Rotate/configure the upload key before Managed Google Play setup."
+  printf '%s\n' 'In Play Console, create a private app with package ID com.constrovet.challanse and enable Google-managed Play App Signing.'
+  printf '%s\n' 'Add the client organization IDs under Managed Google Play availability and grant the deployment service account access to this app.'
+  read -r -p 'Type PLAY PRIVATE APP READY after those console steps are complete: ' confirmation
+  [[ "$confirmation" == "PLAY PRIVATE APP READY" ]] || die "Managed Google Play setup was not confirmed."
+  read -r -p 'Play app-signing certificate SHA-256 (64 hex characters, no colons): ' play_fingerprint
+  play_fingerprint="$(tr -d ':' <<<"$play_fingerprint" | tr '[:lower:]' '[:upper:]')"
+  [[ "$play_fingerprint" =~ ^[0-9A-F]{64}$ && "$play_fingerprint" != "$upload_fingerprint" ]] || die "Play app-signing fingerprint is invalid or incorrectly matches the upload certificate."
+  read -r -p 'Google Cloud project number linked to Play Integrity: ' cloud_project_number
+  [[ "$cloud_project_number" =~ ^[1-9][0-9]{5,19}$ ]] || die "Play Integrity Cloud project number is invalid."
+  read -r -p 'Google Play service-account JSON file: ' service_account_file
+  service_account_file="$(realpath -e "$service_account_file")"
+  [[ -f "$service_account_file" && "$service_account_file" != "$ROOT"/* ]] || die "Service-account JSON must be an existing file outside this repository."
+  jq -e '.type == "service_account" and (.client_email | type == "string" and length > 0) and (.private_key | type == "string" and length > 0)' >/dev/null "$service_account_file" || die "Invalid Google Play service-account JSON."
+  read -r -p 'JSON file containing the approved Managed Google Play organization ID array: ' organization_ids_file
+  organization_ids_file="$(realpath -e "$organization_ids_file")"
+  [[ -f "$organization_ids_file" && "$organization_ids_file" != "$ROOT"/* ]] || die "Organization IDs must be supplied from a file outside this repository."
+  jq -e 'type == "array" and length > 0 and length <= 100 and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{3,128}$")) and (unique | length) == length' >/dev/null "$organization_ids_file" || die "Organization IDs file must contain 1-100 unique ID strings."
+  organization_ids_canonical="$(jq -c 'sort' "$organization_ids_file")"
+  organization_ids_sha256="$(printf '%s' "$organization_ids_canonical" | sha256sum | awk '{print $1}')"
+  organization_ids_count="$(jq 'length' <<<"$organization_ids_canonical")"
+  gh secret set PLAY_SERVICE_ACCOUNT_JSON --repo "$REPO" --env production < "$service_account_file"
+  printf '%s' "$organization_ids_canonical" | gh secret set PLAY_MANAGED_ORGANIZATION_IDS --repo "$REPO" --env production
+  gh variable set CHALLANSE_PLAY_APP_SIGNING_CERT_SHA256 --repo "$REPO" --env production --body "$play_fingerprint"
+  gh variable set PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER --repo "$REPO" --env production --body "$cloud_project_number"
+  gh variable set PLAY_MANAGED_ORGANIZATIONS_SHA256 --repo "$REPO" --env production --body "$organization_ids_sha256"
+  gh variable set PLAY_MANAGED_ORGANIZATIONS_COUNT --repo "$REPO" --env production --body "$organization_ids_count"
+  gh variable set PLAY_RELEASE_TRACK --repo "$REPO" --env production --body internal
+  gh variable set PLAY_PUBLISH_ENABLED --repo "$REPO" --env production --body true
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  unset organization_ids_canonical
+  printf 'Managed Google Play is configured for %s approved organization(s) on the internal track. Production remains disabled.\n' "$organization_ids_count"
+}
+
+accept_client() {
+  local report="${1:-}" digest confirmation
+  [[ -r "$report" ]] || die "Usage: $0 accept-client /secure/client-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and (.client_organization_id_hash | test("^[a-f0-9]{64}$")) and
+    .managed_play_access_confirmed == true and .controlled_rollout_accepted == true and
+    (.accepted_by | type == "string" and length > 0) and
+    (.accepted_at | type == "string") and (try (.accepted_at | fromdateiso8601) catch null) != null and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
+  ' "$report" >/dev/null || die "Client acceptance does not satisfy the controlled-rollout gate."
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT CLIENT $digest after reviewing the signed evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT CLIENT $digest" ]] || die "Client acceptance cancelled."
+  gh variable set CLIENT_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Client acceptance evidence recorded: %s\n' "$digest"
+}
+
+accept_operator_training() {
+  local report="${1:-}" digest confirmation
+  [[ -r "$report" ]] || die "Usage: $0 accept-operator-training /secure/operator-training.json"
+  jq -e '
+    .schema_version == "1.0" and .trained_operators >= 2 and
+    .incident_runbook_exercise_passed == true and .restore_observation_completed == true and
+    .independent_production_approval_enabled == true and
+    (.completed_at | type == "string" and length > 0) and
+    (.evidence_owner | type == "string" and length > 0)
+  ' "$report" >/dev/null || die "Operator training evidence does not satisfy the client-two gate."
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT OPERATOR TRAINING $digest after reviewing the evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT OPERATOR TRAINING $digest" ]] || die "Operator training acceptance cancelled."
+  gh variable set OPERATOR_TRAINING_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Second-operator training evidence recorded: %s\n' "$digest"
+}
+
+accept_security() {
+  local report="${1:-}" digest confirmation
+  [[ -r "$report" ]] || die "Usage: $0 accept-security /secure/security-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and .tenants_tested >= 2 and
+    .cross_tenant_endpoint_tests_passed == true and .postgres_rls_direct_access_denied == true and
+    .forged_oidc_rejected == true and .replayed_device_nonces_rejected == true and
+    .owasp_masvs_review_completed == true and .owasp_api_review_completed == true and
+    (.unresolved_critical_findings | type == "number") and .unresolved_critical_findings == 0 and
+    (.unresolved_high_findings | type == "number") and .unresolved_high_findings == 0 and
+    (.completed_at | type == "string") and (try (.completed_at | fromdateiso8601) catch null) != null and
+    (.evidence_owner | type == "string" and length > 0) and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
+  ' "$report" >/dev/null || die "Security evidence does not satisfy the production gate."
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT SECURITY $digest after reviewing the evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT SECURITY $digest" ]] || die "Security acceptance cancelled."
+  gh variable set SECURITY_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Security acceptance evidence recorded: %s\n' "$digest"
+}
+
+accept_capacity() {
+  local report="${1:-}" digest confirmation
+  [[ -r "$report" ]] || die "Usage: $0 accept-capacity /secure/capacity-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and
+    (.receipts_per_day | type == "number") and .receipts_per_day >= 1000 and
+    (.reconnecting_devices | type == "number") and .reconnecting_devices >= 100 and
+    (.reconnect_window_minutes | type == "number") and .reconnect_window_minutes >= 0 and .reconnect_window_minutes <= 10 and
+    (.final_ack_p95_ms | type == "number") and .final_ack_p95_ms >= 0 and .final_ack_p95_ms < 2000 and
+    (.backlog_drain_minutes | type == "number") and .backlog_drain_minutes >= 0 and .backlog_drain_minutes <= 15 and
+    (.lost_receipts | type == "number") and .lost_receipts == 0 and
+    (.duplicate_receipts | type == "number") and .duplicate_receipts == 0 and
+    (.acceptance_network_profile | type == "string" and length > 0) and
+    (.completed_at | type == "string") and (try (.completed_at | fromdateiso8601) catch null) != null and
+    (.evidence_owner | type == "string" and length > 0) and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
+  ' "$report" >/dev/null || die "Capacity evidence does not satisfy the production gate."
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT CAPACITY $digest after reviewing the evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT CAPACITY $digest" ]] || die "Capacity acceptance cancelled."
+  gh variable set CAPACITY_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Capacity acceptance evidence recorded: %s\n' "$digest"
+}
+
+accept_recovery() {
+  local report="${1:-}" digest confirmation
+  [[ -r "$report" ]] || die "Usage: $0 accept-recovery /secure/recovery-acceptance.json"
+  jq -e '
+    .schema_version == "1.0" and .postgres_restore_passed == true and .s3_restore_passed == true and
+    (.rpo_minutes | type == "number") and .rpo_minutes >= 0 and .rpo_minutes <= 60 and
+    (.rto_minutes | type == "number") and .rto_minutes >= 0 and .rto_minutes <= 480 and
+    .rollback_passed == true and
+    .alarm_delivery_passed == true and .cross_account_snapshot_verified == true and
+    (.completed_at | type == "string") and (try (.completed_at | fromdateiso8601) catch null) != null and
+    (.evidence_owner | type == "string" and length > 0) and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
+  ' "$report" >/dev/null || die "Recovery evidence does not satisfy the RPO/RTO production gate."
+  digest="$(sha256sum "$report" | awk '{print $1}')"
+  read -r -p "Type ACCEPT RECOVERY $digest after reviewing the evidence: " confirmation
+  [[ "$confirmation" == "ACCEPT RECOVERY $digest" ]] || die "Recovery acceptance cancelled."
+  gh variable set RECOVERY_ACCEPTANCE_SHA256 --repo "$REPO" --env production --body "$digest"
+  printf 'Recovery acceptance evidence recorded: %s\n' "$digest"
+}
+
+set_play_track() {
+  preflight
+  local track="${1:-}" confirmation
+  [[ "$track" == "internal" || "$track" == "alpha" || "$track" == "production" ]] || die "Usage: $0 set-play-track internal|alpha|production"
+  if [[ "$track" == "production" ]]; then
+    [[ "$(github_environment_variable CLIENT_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Production track requires signed client acceptance evidence."
+  fi
+  read -r -p "Type SET PLAY TRACK $track to change the next release track: " confirmation
+  [[ "$confirmation" == "SET PLAY TRACK $track" ]] || die "Play track unchanged."
+  gh variable set PLAY_RELEASE_TRACK --repo "$REPO" --env production --body "$track"
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  printf 'Next Managed Google Play release track: %s\n' "$track"
 }
 
 rotate_enrichment_keys() {
@@ -641,7 +871,7 @@ rotate_enrichment_keys() {
 configure_aws() {
   preflight
   local variables name label value
-  variables='AWS_PRODUCTION_ACCOUNT_ID AWS_PRODUCTION_TERRAFORM_ROLE_ARN AWS_ECR_REPOSITORY AWS_ADOT_COLLECTOR_IMAGE AWS_TERRAFORM_STATE_BUCKET AWS_TERRAFORM_STATE_KMS_KEY_ARN AWS_ENRICHMENT_CERTIFICATE_ARN AWS_MONTHLY_BUDGET_USD AWS_BUDGET_EMAIL AWS_GITHUB_OIDC_PROVIDER_ARN'
+  variables='AWS_PRODUCTION_ACCOUNT_ID AWS_PRODUCTION_TERRAFORM_ROLE_ARN AWS_ECR_REPOSITORY AWS_ADOT_COLLECTOR_IMAGE AWS_CLOUDFLARED_IMAGE AWS_TERRAFORM_STATE_BUCKET AWS_TERRAFORM_STATE_KMS_KEY_ARN AWS_BACKUP_DESTINATION_VAULT_ARN AWS_MONTHLY_BUDGET_USD AWS_BUDGET_EMAIL AWS_GITHUB_OIDC_PROVIDER_ARN'
   for name in $variables; do
     label="${name//_/ }"
     prompt_value "$name" "$label"
@@ -695,7 +925,7 @@ rotate_signing() {
   printf '%s' challanse | gh secret set CHALLANSE_KEY_ALIAS --repo "$REPO" --env production
   printf '%s' "$password" | gh secret set CHALLANSE_KEY_PASSWORD --repo "$REPO" --env production
   gh variable set CHALLANSE_REVOKED_SIGNING_CERT_SHA256 --repo "$REPO" --env production --body "$old_fingerprint"
-  gh variable set CHALLANSE_SIGNING_CERT_SHA256 --repo "$REPO" --env production --body "$fingerprint"
+  gh variable set CHALLANSE_UPLOAD_CERT_SHA256 --repo "$REPO" --env production --body "$fingerprint"
   save_state SIGNING_KEYSTORE_PATH "$keystore"
   save_state SIGNING_CERT_SHA256 "$fingerprint"
   save_state SIGNING_ENCRYPTED_BACKUP_PATH "$backup_path"
@@ -706,20 +936,41 @@ rotate_signing() {
 
 deploy() {
   preflight
-  local required_secrets required_variables run_id pending ids body deployment_flag commit_sha confirmation github_fingerprint
-  required_secrets='["CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_API_TOKEN","DEVICE_TOKEN_PEPPER","TURNSTILE_SECRET","CHALLANSE_KEYSTORE_BASE64","CHALLANSE_KEYSTORE_PASSWORD","CHALLANSE_KEY_ALIAS","CHALLANSE_KEY_PASSWORD","EDGE_TO_ENRICHMENT_HMAC_KEY","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY","ENRICHMENT_TO_EDGE_HMAC_KEY","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY","ENRICHMENT_ACCESS_CLIENT_ID","ENRICHMENT_ACCESS_CLIENT_SECRET"]'
-  required_variables='["CLOUDFLARE_D1_DATABASE_ID","CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","TURNSTILE_SITE_KEY","CHALLANSE_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256","ENRICHMENT_URL","EDGE_TO_ENRICHMENT_HMAC_KEY_ID","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID","AWS_PRODUCTION_ACCOUNT_ID","AWS_PRODUCTION_TERRAFORM_ROLE_ARN","AWS_ECR_REPOSITORY","AWS_ADOT_COLLECTOR_IMAGE","AWS_TERRAFORM_STATE_BUCKET","AWS_TERRAFORM_STATE_KMS_KEY_ARN","AWS_ENRICHMENT_CERTIFICATE_ARN","AWS_MONTHLY_BUDGET_USD","AWS_BUDGET_EMAIL","AWS_GITHUB_OIDC_PROVIDER_ARN","AWS_RUNTIME_SECRET_ARN","AWS_DEAD_LETTER_QUEUE_URL","AWS_ENRICHMENT_BOOTSTRAPPED","STAGING_ACCEPTANCE_SHA256","ANDROID_FIELD_ACCEPTANCE_SHA256"]'
+  local required_secrets required_variables run_id pending ids body deployment_flag commit_sha confirmation github_fingerprint organization_count protection required_approvals
+  required_secrets='["CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_API_TOKEN","DEVICE_TOKEN_PEPPER","TURNSTILE_SECRET","CHALLANSE_KEYSTORE_BASE64","CHALLANSE_KEYSTORE_PASSWORD","CHALLANSE_KEY_ALIAS","CHALLANSE_KEY_PASSWORD","PLAY_SERVICE_ACCOUNT_JSON","PLAY_MANAGED_ORGANIZATION_IDS","EDGE_TO_ENRICHMENT_HMAC_KEY","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY","ENRICHMENT_TO_EDGE_HMAC_KEY","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY","ENRICHMENT_ACCESS_CLIENT_ID","ENRICHMENT_ACCESS_CLIENT_SECRET"]'
+  required_variables='["CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","CLOUDFLARE_FREE_WAF_ENABLED","ACCESS_IDENTITY_PROVIDER_ID","ACCESS_MFA_ENFORCED","TURNSTILE_SITE_KEY","CHALLANSE_UPLOAD_CERT_SHA256","CHALLANSE_PLAY_APP_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256","PLAY_PUBLISH_ENABLED","PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER","PLAY_MANAGED_ORGANIZATIONS_SHA256","PLAY_MANAGED_ORGANIZATIONS_COUNT","PLAY_RELEASE_TRACK","ENRICHMENT_URL","EDGE_TO_ENRICHMENT_HMAC_KEY_ID","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID","AWS_PRODUCTION_ACCOUNT_ID","AWS_PRODUCTION_TERRAFORM_ROLE_ARN","AWS_ECR_REPOSITORY","AWS_ADOT_COLLECTOR_IMAGE","AWS_CLOUDFLARED_IMAGE","AWS_TERRAFORM_STATE_BUCKET","AWS_TERRAFORM_STATE_KMS_KEY_ARN","AWS_BACKUP_DESTINATION_VAULT_ARN","AWS_MONTHLY_BUDGET_USD","AWS_BUDGET_EMAIL","AWS_GITHUB_OIDC_PROVIDER_ARN","AWS_RUNTIME_SECRET_ARN","AWS_DEAD_LETTER_QUEUE_URL","AWS_ENRICHMENT_BOOTSTRAPPED","STAGING_ACCEPTANCE_SHA256","ANDROID_FIELD_ACCEPTANCE_SHA256","SECURITY_ACCEPTANCE_SHA256","CAPACITY_ACCEPTANCE_SHA256","RECOVERY_ACCEPTANCE_SHA256"]'
   jq -e --argjson required "$required_secrets" '($required - [.[].name]) | length == 0' >/dev/null < <(gh secret list --repo "$REPO" --env production --json name) || die "Required production secrets are missing."
   jq -e --argjson required "$required_variables" '($required - [.[].name]) | length == 0' >/dev/null < <(gh variable list --repo "$REPO" --env production --json name) || die "Required production variables are missing."
   local revoked_fingerprint
   revoked_fingerprint="$(github_environment_variable CHALLANSE_REVOKED_SIGNING_CERT_SHA256)"
-  github_fingerprint="$(github_environment_variable CHALLANSE_SIGNING_CERT_SHA256)"
+  github_fingerprint="$(github_environment_variable CHALLANSE_UPLOAD_CERT_SHA256)"
   [[ -n "$revoked_fingerprint" && -n "$github_fingerprint" && "$revoked_fingerprint" != "$github_fingerprint" ]] || die "Rotate the exposed Android signing identity before deployment: ./scripts/go-live.sh rotate-signing"
+  [[ "$(github_environment_variable ACCESS_MFA_ENFORCED)" == "true" ]] || die "Enterprise OIDC with MFA is not enforced. Run: ./scripts/go-live.sh configure-identity"
+  [[ "$(github_environment_variable CLOUDFLARE_FREE_WAF_ENABLED)" == "true" ]] || die "Cloudflare Free Managed Ruleset is not recorded as enabled. Rerun provision."
+  assert_free_managed_waf
+  [[ "$(github_environment_variable PLAY_PUBLISH_ENABLED)" == "true" ]] || die "Managed Google Play publishing remains disabled. Run configure-play after Play Console setup."
+  [[ "$(github_environment_variable PLAY_RELEASE_TRACK)" =~ ^(internal|alpha|production)$ ]] || die "Managed Google Play release track is invalid."
+  organization_count="$(github_environment_variable PLAY_MANAGED_ORGANIZATIONS_COUNT)"
+  [[ "$organization_count" =~ ^[1-9][0-9]*$ ]] || die "Managed Google Play organization count is invalid."
+  if [[ "$organization_count" -gt 1 ]]; then
+    [[ "$(github_environment_variable OPERATOR_TRAINING_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Client two requires accepted second-operator training evidence. Run: ./scripts/go-live.sh accept-operator-training /secure/operator-training.json"
+    protection="$(gh api "repos/$REPO/branches/main/protection")"
+    required_approvals="$(jq -r '.required_pull_request_reviews.required_approving_review_count // 0' <<<"$protection")"
+    [[ "$required_approvals" -ge 1 && "$(jq -r '.enforce_admins.enabled // false' <<<"$protection")" == "true" ]] || die "Client two requires one independent PR approval with administrator enforcement. Add a second maintainer and rerun harden-github."
+  fi
+  if [[ "$(github_environment_variable PLAY_RELEASE_TRACK)" == "production" ]]; then
+    [[ "$(github_environment_variable CLIENT_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Production Play track requires signed client acceptance evidence."
+  fi
+  [[ "$(github_environment_variable STAGING_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Staging acceptance evidence is missing or malformed."
+  [[ "$(github_environment_variable ANDROID_FIELD_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Android field acceptance evidence is missing or malformed."
+  [[ "$(github_environment_variable SECURITY_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Security acceptance evidence is missing or malformed."
+  [[ "$(github_environment_variable CAPACITY_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Capacity acceptance evidence is missing or malformed."
+  [[ "$(github_environment_variable RECOVERY_ACCEPTANCE_SHA256)" =~ ^[a-f0-9]{64}$ ]] || die "Recovery acceptance evidence is missing or malformed."
   [[ "$(github_environment_variable AWS_ENRICHMENT_BOOTSTRAPPED)" == "true" ]] || die "AWS enrichment is not bootstrapped. Keep services stopped, populate the runtime secret, validate staging, then set AWS_ENRICHMENT_BOOTSTRAPPED=true."
   deployment_flag="$(gh variable list --repo "$REPO" --json name,value --jq '.[] | select(.name == "PILOT_DEPLOY_ENABLED") | .value')"
   [[ "$deployment_flag" == "false" ]] || die "PILOT_DEPLOY_ENABLED must be false before deployment. Run rollback-production.sh first."
   load_state
-  github_fingerprint="$(github_environment_variable CHALLANSE_SIGNING_CERT_SHA256)"
+  github_fingerprint="$(github_environment_variable CHALLANSE_UPLOAD_CERT_SHA256)"
   [[ -n "${SIGNING_CERT_SHA256:-}" && "$github_fingerprint" == "$SIGNING_CERT_SHA256" ]] || die "Signing fingerprint is missing or inconsistent. Rerun configure-github."
   commit_sha="$(git rev-parse HEAD)"
   printf 'Production commit: %s\nSigning certificate SHA-256: %s\n' "$commit_sha" "$github_fingerprint"
@@ -754,9 +1005,19 @@ accept_staging() {
   local report="${1:-}"
   [[ -r "$report" ]] || die "Usage: $0 accept-staging /secure/staging-acceptance.json"
   jq -e '
-    .schema_version == "1.0" and .synthetic_receipts >= 20 and .lost_receipts == 0 and
-    .duplicate_receipts == 0 and .cross_site_access_denied == true and .callback_replay_denied == true and
-    .dlq_replay_passed == true and .rollback_passed == true
+    .schema_version == "1.0" and
+    (.synthetic_receipts | type == "number") and .synthetic_receipts >= 20 and
+    (.lost_receipts | type == "number") and .lost_receipts == 0 and
+    (.duplicate_receipts | type == "number") and .duplicate_receipts == 0 and
+    .cross_site_access_denied == true and .callback_replay_denied == true and
+    .dlq_replay_passed == true and .rollback_passed == true and
+    (.completed_at | type == "string") and (try (.completed_at | fromdateiso8601) catch null) != null and
+    (.evidence_owner | type == "string" and length > 0) and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
   ' "$report" >/dev/null || die "Staging report does not satisfy the required release gates."
   local digest confirmation
   digest="$(sha256sum "$report" | awk '{print $1}')"
@@ -770,11 +1031,24 @@ accept_android_field() {
   local report="${1:-}"
   [[ -r "$report" ]] || die "Usage: $0 accept-android-field /secure/android-field-acceptance.json"
   jq -e '
-    .schema_version == "1.0" and .android_api_level == 26 and .device_ram_mb <= 2048 and .binary_writes >= 100 and
-    .minimum_image_bytes <= 500000 and .maximum_image_bytes >= 5000000 and .p95_write_ms < 50 and
-    .metadata_loss_count == 0 and .sqlcipher_status_verified == true and .wrong_key_rejected == true and
+    .schema_version == "1.0" and
+    (.android_api_level | type == "number") and .android_api_level == 26 and
+    (.device_ram_mb | type == "number") and .device_ram_mb > 0 and .device_ram_mb <= 2048 and
+    (.binary_writes | type == "number") and .binary_writes >= 100 and
+    (.minimum_image_bytes | type == "number") and .minimum_image_bytes > 0 and .minimum_image_bytes <= 500000 and
+    (.maximum_image_bytes | type == "number") and .maximum_image_bytes >= 5000000 and
+    (.p95_write_ms | type == "number") and .p95_write_ms >= 0 and .p95_write_ms < 50 and
+    (.metadata_loss_count | type == "number") and .metadata_loss_count == 0 and
+    .sqlcipher_status_verified == true and .wrong_key_rejected == true and
     .raw_database_scan_clean == true and .restart_recovery_passed == true and .reboot_sync_passed == true and
-    .interrupted_upload_resume_passed == true
+    .interrupted_upload_resume_passed == true and
+    (.completed_at | type == "string") and (try (.completed_at | fromdateiso8601) catch null) != null and
+    (.evidence_owner | type == "string" and length > 0) and
+    (.evidence_artifacts | type == "array" and length > 0) and
+    all(.evidence_artifacts[];
+      (.name | type == "string" and length > 0) and
+      (.sha256 | type == "string" and test("^[a-f0-9]{64}$"))) and
+    ([.evidence_artifacts[].name] | unique | length) == (.evidence_artifacts | length)
   ' "$report" >/dev/null || die "Android field report does not satisfy encryption, durability, and p95 gates."
   local digest confirmation
   digest="$(sha256sum "$report" | awk '{print $1}')"
@@ -786,18 +1060,36 @@ accept_android_field() {
 
 rotate_device_pepper() {
   preflight
-  load_state
-  render_edge_config
-  local confirmation pepper
+  need aws
+  need cloudflared
+  local access_token context organization_id site_id confirmation pepper runtime_secret_arn runtime_json updated_runtime revoke_response
   printf '%s\n' 'WARNING: This revokes every enrolled Android device. Each device must be enrolled again; locally queued receipts remain on the devices.'
-  read -r -p 'Type ROTATE DEVICE PEPPER to continue: ' confirmation
-  [[ "$confirmation" == "ROTATE DEVICE PEPPER" ]] || die "Device credential rotation cancelled."
-  wrangler d1 execute challanse-pilot --remote --config apps/edge/wrangler.generated.toml --command \
-    "UPDATE devices SET active = 0; INSERT INTO operations_log (id, event_type, detail_json) VALUES (lower(hex(randomblob(16))), 'DEVICE_PEPPER_ROTATION', '{\"allDevicesRevoked\":true}');"
+  read -r -p 'Site UUID used to authorize this organization-wide operation: ' site_id
+  [[ "$site_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Site ID must be a UUID."
+  access_token="$(cloudflared access token --app=https://review.challanse.constrovet.com)"
+  [[ -n "$access_token" ]] || die "Could not obtain a Cloudflare Access token. Sign in as an ORG_ADMIN and retry."
+  context="$(curl -fsS -H "Cookie: CF_Authorization=$access_token" -H "X-ChallanSe-Site-Id: $site_id" https://review.challanse.constrovet.com/api/v1/reviewer/context)" || die "Could not resolve the authenticated organization context."
+  organization_id="$(jq -r '.organizationId // empty' <<<"$context")"
+  [[ "$organization_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "The reviewer context did not return an organization UUID."
+  read -r -p "Type ROTATE DEVICE PEPPER $organization_id to continue: " confirmation
+  [[ "$confirmation" == "ROTATE DEVICE PEPPER $organization_id" ]] || die "Device credential rotation cancelled."
+  revoke_response="$(curl -fsS -X POST \
+    -H "Cookie: CF_Authorization=$access_token" \
+    -H "X-ChallanSe-Site-Id: $site_id" \
+    -H 'Content-Type: application/json' \
+    --data "$(jq -nc --arg confirmation "REVOKE ALL DEVICES $organization_id" '{confirmation:$confirmation}')" \
+    https://review.challanse.constrovet.com/api/v1/admin/devices/revoke-all)" || die "Device revocation failed; the pepper was not changed."
+  jq -e '.revoked | type == "number" and . >= 0' >/dev/null <<<"$revoke_response" || die "Device revocation returned an invalid response; the pepper was not changed."
+  runtime_secret_arn="$(github_environment_variable AWS_RUNTIME_SECRET_ARN)"
+  [[ -n "$runtime_secret_arn" ]] || die "AWS_RUNTIME_SECRET_ARN is missing from the production environment."
+  runtime_json="$(aws secretsmanager get-secret-value --secret-id "$runtime_secret_arn" --query SecretString --output text)"
   pepper="$(openssl rand -hex 32)"
+  updated_runtime="$(jq -c --arg pepper "$pepper" '.DEVICE_TOKEN_PEPPER=$pepper' <<<"$runtime_json")"
+  printf '%s' "$updated_runtime" | aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string file:///dev/stdin >/dev/null
   printf '%s' "$pepper" | gh secret set DEVICE_TOKEN_PEPPER --repo "$REPO" --env production
-  unset pepper CLOUDFLARE_API_TOKEN
-  printf 'Device pepper rotated and all cloud device credentials revoked. Re-enroll pilot devices before syncing.\n'
+  gh variable set PILOT_DEPLOY_ENABLED --repo "$REPO" --body false
+  unset access_token context revoke_response pepper runtime_json updated_runtime CLOUDFLARE_API_TOKEN
+  printf 'Device pepper rotated after revoking all organization devices. Re-enroll devices before syncing; local queues were not deleted.\n'
 }
 
 replay_dlq() {
@@ -854,25 +1146,81 @@ seed() {
   local vendors_file=""
   [[ "${1:-}" == "--vendors-file" && -n "${2:-}" ]] || die "Usage: $0 seed --vendors-file /secure/challanse-vendors.json"
   vendors_file="$2"; [[ -r "$vendors_file" ]] || die "Vendor file is not readable: $vendors_file"
-  jq -e 'type == "array" and length >= 1 and length <= 4 and all(.[]; (.id|type=="string") and (.name|type=="string") and (.initials|type=="string") and (.color|test("^#[0-9A-Fa-f]{6}$")))' "$vendors_file" >/dev/null || die "Vendor JSON is invalid."
+  jq -e 'type == "array" and length >= 1 and length <= 20 and all(.[]; (.id|type=="string" and test("^[A-Za-z0-9._-]{1,64}$")) and (.name|type=="string" and length >= 2 and length <= 160) and (.initials|type=="string" and length >= 1 and length <= 3) and (.color|type=="string" and test("^#[0-9A-Fa-f]{6}$")))' "$vendors_file" >/dev/null || die "Vendor JSON is invalid."
   preflight
+  need aws
   assert_production_https_accepted
-  load_state
-  prompt_value SITE_ID "Site ID"
-  prompt_value SITE_NAME "Site name"
-  prompt_value WIFI_SSIDS_JSON 'Approved Wi-Fi SSIDs JSON, for example ["Site Office"]'
-  jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' >/dev/null <<<"$WIFI_SSIDS_JSON" || die "Wi-Fi JSON is invalid."
-  local reviewers sql_file vendors_json
-  reviewers="$(jq -nc --arg first "$REVIEWER_EMAIL_1" --arg second "$REVIEWER_EMAIL_2" '[$first,$second]')"
-  vendors_json="$(jq -c . "$vendors_file")"
-  sql_file="$(mktemp /tmp/challanse-seed.XXXXXX.sql)"
-  trap 'rm -f "$sql_file"' RETURN
-  SITE_ID="$SITE_ID" SITE_NAME="$SITE_NAME" REVIEWER_EMAILS_JSON="$reviewers" WIFI_SSIDS_JSON="$WIFI_SSIDS_JSON" VENDORS_JSON="$vendors_json" node scripts/bootstrap-pilot.mjs > "$sql_file"
-  render_edge_config
-  confirm "Apply the reviewed real site, reviewers, Wi-Fi, and vendors to production D1."
-  wrangler d1 execute challanse-pilot --remote --config apps/edge/wrangler.generated.toml --file "$sql_file"
-  rm -f "$sql_file"; trap - RETURN
-  printf 'Real pilot configuration seeded. Generate enrollment QR codes in the reviewer application.\n'
+  local organization_id organization_slug organization_name site_id site_name wifi_ssids_json reviewer_issuer reviewer_subject reviewer_email reviewer_display_name confirmation payload runtime_secret_arn runtime_json bootstrap_runtime restore_runtime cluster task_definition subnets security_group task_response task_arn exit_code stopped_reason task_status restore_status bootstrap_secret_staged=0
+  read -r -p 'Organization UUID: ' organization_id
+  [[ "$organization_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Organization ID must be a UUID."
+  read -r -p 'Organization slug (lowercase letters, numbers, dashes): ' organization_slug
+  [[ "$organization_slug" =~ ^[a-z0-9-]{2,80}$ ]] || die "Organization slug is invalid."
+  prompt_value organization_name "Organization name"
+  [[ ${#organization_name} -le 160 ]] || die "Organization name is too long."
+  read -r -p 'Site UUID: ' site_id
+  [[ "$site_id" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Site ID must be a UUID."
+  prompt_value site_name "Site name"
+  [[ ${#site_name} -le 160 ]] || die "Site name is too long."
+  prompt_value wifi_ssids_json 'Approved Wi-Fi SSIDs JSON, for example ["Site Office"]'
+  jq -e 'type == "array" and length >= 1 and length <= 20 and all(.[]; type == "string" and length >= 1 and length <= 64)' >/dev/null <<<"$wifi_ssids_json" || die "Wi-Fi JSON is invalid."
+  prompt_value reviewer_issuer "Reviewer OIDC issuer URL"
+  [[ "$reviewer_issuer" =~ ^https:// ]] || die "OIDC issuer must be an HTTPS URL."
+  prompt_value reviewer_subject "Reviewer immutable OIDC subject"
+  prompt_value reviewer_email "Reviewer email attribute"
+  [[ "$reviewer_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "Reviewer email is invalid."
+  prompt_value reviewer_display_name "Reviewer display name"
+  read -r -p "Type BOOTSTRAP $organization_id to authorize this tenant bootstrap: " confirmation
+  [[ "$confirmation" == "BOOTSTRAP $organization_id" ]] || die "Tenant bootstrap cancelled."
+  payload="$(jq -nc \
+    --arg organization_id "$organization_id" --arg organization_slug "$organization_slug" --arg organization_name "$organization_name" \
+    --arg site_id "$site_id" --arg site_name "$site_name" --argjson allowed_wifi_ssids "$wifi_ssids_json" \
+    --arg reviewer_issuer "$reviewer_issuer" --arg reviewer_subject "$reviewer_subject" --arg reviewer_email "$reviewer_email" \
+    --arg reviewer_display_name "$reviewer_display_name" --argjson vendors "$(jq -c . "$vendors_file")" --arg confirmation "$confirmation" \
+    '{organization_id:$organization_id,organization_slug:$organization_slug,organization_name:$organization_name,site_id:$site_id,site_name:$site_name,allowed_wifi_ssids:$allowed_wifi_ssids,reviewer_issuer:$reviewer_issuer,reviewer_subject:$reviewer_subject,reviewer_email:$reviewer_email,reviewer_display_name:$reviewer_display_name,vendors:$vendors,confirmation:$confirmation}')"
+  runtime_secret_arn="$(github_environment_variable AWS_RUNTIME_SECRET_ARN)"
+  [[ -n "$runtime_secret_arn" ]] || die "AWS_RUNTIME_SECRET_ARN is missing from the production environment."
+  runtime_json="$(aws secretsmanager get-secret-value --secret-id "$runtime_secret_arn" --query SecretString --output text)"
+  jq -e '.TENANT_BOOTSTRAP_JSON == "{}"' >/dev/null <<<"$runtime_json" || die "A tenant bootstrap payload is already staged. Clear it through the incident runbook before retrying."
+  bootstrap_runtime="$(jq -c --argjson payload "$payload" '.TENANT_BOOTSTRAP_JSON=($payload|tojson)' <<<"$runtime_json")"
+  restore_runtime="$(jq -c '.TENANT_BOOTSTRAP_JSON="{}"' <<<"$runtime_json")"
+
+  cluster="$(aws ecs list-clusters --query "clusterArns[?contains(@, 'challanse-production')] | [0]" --output text)"
+  task_definition="$(aws ecs list-task-definitions --family-prefix challanse-production-migration --sort DESC --max-items 1 --query 'taskDefinitionArns[0]' --output text)"
+  subnets="$(aws ec2 describe-subnets --filters Name=tag:Project,Values=challanse Name=tag:Environment,Values=production Name=tag:Name,Values='*private*' --query 'Subnets[].SubnetId' --output text | tr '\t' ',')"
+  security_group="$(aws ec2 describe-security-groups --filters Name=group-name,Values=challanse-production-service Name=tag:Project,Values=challanse Name=tag:Environment,Values=production --query 'SecurityGroups[0].GroupId' --output text)"
+  [[ "$cluster" == arn:* && "$task_definition" == arn:* && "$subnets" == subnet-* && "$security_group" == sg-* ]] || die "Could not discover the production migration task network. Deploy AWS infrastructure first."
+
+  printf '%s' "$bootstrap_runtime" | aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string file:///dev/stdin >/dev/null
+  bootstrap_secret_staged=1
+  trap 'status=$?; if [[ "${bootstrap_secret_staged:-0}" == "1" ]]; then printf "%s" "$restore_runtime" | aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string file:///dev/stdin >/dev/null || printf "%s\n" "CRITICAL: tenant bootstrap payload restoration failed; disable deployments and follow the incident runbook." >&2; fi; exit "$status"' EXIT
+  set +e
+  task_response="$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" --launch-type FARGATE \
+    --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" \
+    --overrides '{"containerOverrides":[{"name":"migration","command":["python","-m","app.bootstrap"]}]}' --output json)"
+  task_status=$?
+  if [[ $task_status -eq 0 ]]; then
+    task_arn="$(jq -r '.tasks[0].taskArn // empty' <<<"$task_response")"
+    [[ -n "$task_arn" ]] || task_status=1
+  fi
+  if [[ $task_status -eq 0 ]]; then
+    aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn"
+    task_status=$?
+  fi
+  if [[ $task_status -eq 0 ]]; then
+    task_response="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" --output json)"
+    exit_code="$(jq -r '.tasks[0].containers[] | select(.name == "migration") | .exitCode // empty' <<<"$task_response")"
+    stopped_reason="$(jq -r '.tasks[0].stoppedReason // "unknown"' <<<"$task_response")"
+    [[ "$exit_code" == "0" ]] || task_status=1
+  fi
+  printf '%s' "$restore_runtime" | aws secretsmanager put-secret-value --secret-id "$runtime_secret_arn" --secret-string file:///dev/stdin >/dev/null
+  restore_status=$?
+  if [[ $restore_status -eq 0 ]]; then bootstrap_secret_staged=0; fi
+  set -e
+  trap - EXIT
+  unset payload runtime_json bootstrap_runtime restore_runtime task_response CLOUDFLARE_API_TOKEN
+  [[ $restore_status -eq 0 ]] || die "Tenant bootstrap payload restoration failed. Disable deployments and follow the incident runbook before retrying."
+  [[ $task_status -eq 0 ]] || die "Tenant bootstrap task failed (${stopped_reason:-AWS task start failure}). The staged payload was cleared."
+  printf 'AWS tenant bootstrap completed for organization %s and site %s. Generate enrollment codes in the reviewer application.\n' "$organization_id" "$site_id"
 }
 
 verify_dns_unchanged() {
@@ -906,20 +1254,20 @@ verify() {
   printf 'Production verification passed, including authenticated private image streaming and unchanged DNS.\n'
 }
 
-download_apk() {
+download_aab() {
   load_state
   local run_id="${LAST_DEPLOY_RUN_ID:-}" output="${ROOT}/dist/release"
   if [[ -z "$run_id" ]]; then run_id="$(gh run list --repo "$REPO" --workflow "$WORKFLOW" --event workflow_dispatch --status success --limit 1 --json databaseId --jq '.[0].databaseId')"; fi
   [[ -n "$run_id" ]] || die "No successful production run was found."
   rm -rf "$output"; mkdir -p "$output"
-  gh run download "$run_id" --repo "$REPO" --name challanse-android-release --dir "$output"
+  gh run download "$run_id" --repo "$REPO" --name challanse-android-app-bundle --dir "$output"
   gh run download "$run_id" --repo "$REPO" --name challanse-release-manifest --dir "$output" || die "Release manifest artifact was not found."
-  local apk; apk="$(find "$output" -type f -name '*.apk' -print -quit)"; [[ -n "$apk" ]] || die "APK artifact was not found."
+  local bundle; bundle="$(find "$output" -type f -name '*.aab' -print -quit)"; [[ -n "$bundle" ]] || die "AAB artifact was not found."
   local actual expected
-  actual="$(sha256sum "$apk" | awk '{print $1}')"
-  expected="$(jq -r '.apk_sha256 // empty' "$output/release-manifest.json")"
-  [[ -n "$expected" && "$actual" == "$expected" ]] || die "APK checksum does not match the signed release manifest."
-  printf '%s  %s\n' "$actual" "$apk"
+  actual="$(sha256sum "$bundle" | awk '{print $1}')"
+  expected="$(jq -r '.aab_sha256 // empty' "$output/release-manifest.json")"
+  [[ -n "$expected" && "$actual" == "$expected" ]] || die "AAB checksum does not match the signed release manifest."
+  printf '%s  %s\n' "$actual" "$bundle"
   printf 'Verified release manifest: %s\n' "$output/release-manifest.json"
 }
 
@@ -931,8 +1279,16 @@ Usage: scripts/go-live.sh <command>
   dns-accept
   preflight
   provision
+  configure-identity
   configure-github
   configure-enrichment
+  configure-play
+  accept-client /secure/client-acceptance.json
+  accept-operator-training /secure/operator-training.json
+  accept-security /secure/security-acceptance.json
+  accept-capacity /secure/capacity-acceptance.json
+  accept-recovery /secure/recovery-acceptance.json
+  set-play-track internal|alpha|production
   rotate-enrichment-keys stage|promote
   configure-aws
   rotate-signing
@@ -945,7 +1301,7 @@ Usage: scripts/go-live.sh <command>
   replay-dlq
   seed --vendors-file /secure/challanse-vendors.json
   verify
-  download-apk
+  download-aab
 USAGE
 }
 
@@ -956,8 +1312,16 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     dns-accept) dns_accept ;;
     preflight) preflight ;;
     provision) provision ;;
+    configure-identity) configure_identity ;;
     configure-github) configure_github ;;
     configure-enrichment) configure_enrichment ;;
+    configure-play) configure_play ;;
+    accept-client) accept_client "${2:-}" ;;
+    accept-operator-training) accept_operator_training "${2:-}" ;;
+    accept-security) accept_security "${2:-}" ;;
+    accept-capacity) accept_capacity "${2:-}" ;;
+    accept-recovery) accept_recovery "${2:-}" ;;
+    set-play-track) set_play_track "${2:-}" ;;
     rotate-enrichment-keys) rotate_enrichment_keys "${2:-}" ;;
     configure-aws) configure_aws ;;
     rotate-signing) rotate_signing ;;
@@ -970,7 +1334,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     replay-dlq) replay_dlq ;;
     seed) shift; seed "$@" ;;
     verify) verify ;;
-    download-apk) download_apk ;;
+    download-aab) download_aab ;;
     help|-h|--help|'') usage ;;
     *) usage >&2; exit 1 ;;
   esac

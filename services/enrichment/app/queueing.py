@@ -40,6 +40,7 @@ class SqsEventQueue:
             MessageAttributes={
                 "schema_version": {"DataType": "String", "StringValue": event.schema_version},
                 "receipt_id": {"DataType": "String", "StringValue": event.receipt_id},
+                "organization_id": {"DataType": "String", "StringValue": event.organization_id},
                 "site_id": {"DataType": "String", "StringValue": event.site_id},
             },
         )

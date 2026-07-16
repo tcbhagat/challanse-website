@@ -1,12 +1,13 @@
 {
   "schema_version": "1.0",
-  "synthetic_receipts": 0,
+  "receipts_per_day": 0,
+  "reconnecting_devices": 0,
+  "reconnect_window_minutes": null,
+  "final_ack_p95_ms": null,
+  "backlog_drain_minutes": null,
   "lost_receipts": null,
   "duplicate_receipts": null,
-  "cross_site_access_denied": false,
-  "callback_replay_denied": false,
-  "dlq_replay_passed": false,
-  "rollback_passed": false,
+  "acceptance_network_profile": "",
   "completed_at": "",
   "evidence_owner": "",
   "evidence_artifacts": [

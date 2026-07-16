@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allowedOrigins, isWebp, randomEnrollmentCode, sha256Hex } from './security';
+import { allowedOrigins, randomEnrollmentCode, sha256Hex } from './security';
 import type { Env } from './types';
 
 describe('edge security primitives', () => {
@@ -8,11 +8,6 @@ describe('edge security primitives', () => {
     const origins = allowedOrigins(env);
     expect(origins.has('https://review.challanse.constrovet.com')).toBe(true);
     expect(origins.has('https://evil.constrovet.com')).toBe(false);
-  });
-
-  it('detects WebP magic bytes', () => {
-    expect(isWebp(new Uint8Array([82, 73, 70, 70, 0, 0, 0, 0, 87, 69, 66, 80]))).toBe(true);
-    expect(isWebp(new Uint8Array([137, 80, 78, 71]))).toBe(false);
   });
 
   it('creates human-safe one-time codes and deterministic hashes', async () => {

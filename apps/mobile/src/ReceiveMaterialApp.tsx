@@ -19,6 +19,7 @@ import DeviceInfo from 'react-native-device-info';
 import { insertReceiptEvent } from './engine/receiptStore';
 import { startReceiptBackgroundSync } from './sync/receiptBackgroundSync';
 import type { PilotConfiguration, PilotVendor } from './config/deviceEnrollment';
+import { warmPlayIntegrity } from './security/playIntegrity';
 
 const CAPTURE_COOLDOWN_MS = 2000;
 
@@ -129,6 +130,7 @@ function ReceiveMaterialScreen({ configuration }: { configuration: PilotConfigur
   }, [requestPermission]);
 
   useEffect(() => {
+    warmPlayIntegrity().catch(() => undefined);
     startReceiptBackgroundSync({
       ingestBaseUrl: configuration.apiBaseUrl,
       wifiSsids: configuration.allowedWifiSsids,
@@ -179,6 +181,7 @@ function ReceiveMaterialScreen({ configuration }: { configuration: PilotConfigur
         appVersion: DeviceInfo.getVersion(),
         configurationVersion: configuration.configurationVersion,
       });
+      startReceiptBackgroundSync().catch(() => undefined);
 
       Vibration.vibrate(16);
       lastCaptureAtRef.current = Date.now();

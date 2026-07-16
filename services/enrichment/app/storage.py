@@ -1,5 +1,5 @@
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
@@ -8,43 +8,88 @@ from psycopg.types.json import Jsonb
 from .config import Settings
 from .encryption import decrypt_json, encrypt_json
 from .schemas import EnrichmentResult, GstReceiptContext, ReceiptEvent
+from .tenancy import tenant_connection
 
 
-def claim_stage(database_url: str, receipt_id: str, stage: str) -> bool:
-    with psycopg.connect(database_url) as connection:
+def claim_stage(database_url: str, organization_id: str, receipt_id: str, stage: str) -> bool:
+    with tenant_connection(database_url, organization_id) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO workflow_stages (receipt_id, stage, status)
-                VALUES (%s, %s, 'PROCESSING')
+                INSERT INTO workflow_stages (organization_id, receipt_id, stage, status, locked_until)
+                VALUES (%s, %s, %s, 'PROCESSING', NOW() + INTERVAL '5 minutes')
                 ON CONFLICT (receipt_id, stage) DO UPDATE SET
                   status = 'PROCESSING', attempts = workflow_stages.attempts + 1,
-                  last_error_code = NULL, updated_at = NOW()
-                WHERE workflow_stages.status = 'FAILED_RETRYABLE' AND workflow_stages.attempts < 10
+                  last_error_code = NULL, locked_until = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+                WHERE (workflow_stages.status = 'FAILED_RETRYABLE' OR
+                       (workflow_stages.status = 'PROCESSING' AND workflow_stages.locked_until < NOW()))
+                  AND workflow_stages.attempts < 5
                 RETURNING receipt_id
                 """,
-                (receipt_id, stage),
+                (organization_id, receipt_id, stage),
             )
             claimed = cursor.fetchone() is not None
         connection.commit()
     return claimed
 
 
-def fail_stage(database_url: str, receipt_id: str, stage: str, error_code: str, terminal: bool = False) -> None:
-    status = "FAILED_TERMINAL" if terminal else "FAILED_RETRYABLE"
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE workflow_stages SET status = %s, last_error_code = %s, updated_at = NOW()
-                WHERE receipt_id = %s AND stage = %s
-                """,
-                (status, error_code[:120], receipt_id, stage),
-            )
+def stage_status(database_url: str, organization_id: str, receipt_id: str, stage: str) -> str | None:
+    with tenant_connection(database_url, organization_id) as connection:
+        row = connection.execute(
+            "SELECT status FROM workflow_stages WHERE receipt_id = %s AND stage = %s",
+            (receipt_id, stage),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def complete_stage(database_url: str, organization_id: str, receipt_id: str, stage: str) -> None:
+    with tenant_connection(database_url, organization_id) as connection:
+        connection.execute(
+            """
+            UPDATE workflow_stages
+            SET status = 'COMPLETED', completed_at = NOW(), locked_until = NULL, updated_at = NOW()
+            WHERE receipt_id = %s AND stage = %s AND status = 'PROCESSING'
+            """,
+            (receipt_id, stage),
+        )
         connection.commit()
 
 
-def upsert_enrichment(
+def fail_stage(database_url: str, organization_id: str, receipt_id: str, stage: str, error_code: str, terminal: bool = False) -> bool:
+    with tenant_connection(database_url, organization_id) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE workflow_stages
+                SET status = CASE WHEN %s OR attempts >= 5 THEN 'FAILED_TERMINAL' ELSE 'FAILED_RETRYABLE' END,
+                    last_error_code = %s, locked_until = NULL, updated_at = NOW()
+                WHERE receipt_id = %s AND stage = %s
+                RETURNING status
+                """,
+                (terminal, error_code[:120], receipt_id, stage),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+    return row is not None and str(row[0]) == "FAILED_TERMINAL"
+
+
+def _insert_callback(cursor, event: ReceiptEvent, result: EnrichmentResult) -> None:
+    cursor.execute(
+        """
+        INSERT INTO transactional_outbox
+          (id, organization_id, aggregate_id, event_type, event_version, destination, idempotency_key, payload_json)
+        VALUES (%s, %s, %s, 'ENRICHMENT_CALLBACK', %s, 'POSTGRES_PROJECTION', %s, %s)
+        ON CONFLICT (aggregate_id, event_type, event_version) DO NOTHING
+        """,
+        (
+            uuid4(), event.organization_id, event.receipt_id, result.version,
+            f"enrichment-callback:{event.receipt_id}:{result.version}",
+            Jsonb(result.model_dump(mode="json")),
+        ),
+    )
+
+
+def save_ocr_result(
     settings: Settings,
     event: ReceiptEvent,
     status: str,
@@ -54,24 +99,23 @@ def upsert_enrichment(
     gps_latitude: float | None,
     gps_longitude: float | None,
     provider_version: str,
-    gst_status: str = "NOT_CHECKED",
-    sensitive_audit: dict[str, object] | None = None,
-) -> int:
+    finalize: bool,
+) -> EnrichmentResult:
     database_url = settings.database_url
     if not database_url:
         raise RuntimeError("database_url_unconfigured")
-    with psycopg.connect(database_url) as connection:
+    with tenant_connection(database_url, event.organization_id) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO enrichment_receipts (
-                  receipt_id, site_id, vendor_id, captured_at_unix, site_captured_quantity,
+                  receipt_id, organization_id, site_id, vendor_id, captured_at_unix, site_captured_quantity,
                   image_sha256, image_bytes, status, raw_ocr_json, raw_text, ocr_confidence,
                   gps_latitude, gps_longitude, provider_version, gst_status, processing_started_at, processing_completed_at
                 ) VALUES (
-                  %(receipt_id)s, %(site_id)s, %(vendor_id)s, %(captured_at_unix)s, %(site_captured_quantity)s,
+                  %(receipt_id)s, %(organization_id)s, %(site_id)s, %(vendor_id)s, %(captured_at_unix)s, %(site_captured_quantity)s,
                   %(image_sha256)s, %(image_bytes)s, %(status)s, %(raw_ocr_json)s, %(raw_text)s, %(ocr_confidence)s,
-                  %(gps_latitude)s, %(gps_longitude)s, %(provider_version)s, %(gst_status)s, NOW(), NOW()
+                  %(gps_latitude)s, %(gps_longitude)s, %(provider_version)s, 'NOT_CHECKED', NOW(), NOW()
                 )
                 ON CONFLICT (receipt_id) DO UPDATE SET
                   status = excluded.status,
@@ -81,7 +125,6 @@ def upsert_enrichment(
                   gps_latitude = excluded.gps_latitude,
                   gps_longitude = excluded.gps_longitude,
                   provider_version = excluded.provider_version,
-                  gst_status = excluded.gst_status,
                   processing_completed_at = NOW(),
                   version = enrichment_receipts.version + 1,
                   updated_at = NOW()
@@ -96,7 +139,6 @@ def upsert_enrichment(
                     "gps_latitude": gps_latitude,
                     "gps_longitude": gps_longitude,
                     "provider_version": provider_version,
-                    "gst_status": gst_status,
                 },
             )
             version = int(cursor.fetchone()[0])
@@ -105,50 +147,143 @@ def upsert_enrichment(
                 status=status,
                 ocr_confidence=confidence,
                 raw_ocr_json=raw_ocr_json,
-                gst_status=gst_status,
+                gst_status="NOT_CHECKED",
                 version=version,
             )
             cursor.execute(
                 """
-                INSERT INTO immutable_enrichment_audits (id, receipt_id, event_type, event_json)
-                VALUES (%(audit_id)s, %(receipt_id)s, 'OCR_COMPLETED', %(event_json)s)
+                INSERT INTO immutable_enrichment_audits (id, organization_id, receipt_id, event_type, event_json)
+                VALUES (%(audit_id)s, %(organization_id)s, %(receipt_id)s, 'OCR_COMPLETED', %(event_json)s)
+                ON CONFLICT (receipt_id, event_type) DO NOTHING
                 """,
                 {
                     "receipt_id": event.receipt_id,
+                    "organization_id": event.organization_id,
                     "audit_id": uuid4(),
                     "event_json": Jsonb({"status": status, "confidence": confidence, "gps_present": gps_latitude is not None, "provider": provider_version}),
                 },
             )
-            if sensitive_audit:
-                ciphertext = encrypt_json(settings, event.site_id, event.receipt_id, "gst_audit", sensitive_audit)
+            cursor.execute(
+                """
+                UPDATE workflow_stages
+                SET status = 'COMPLETED', completed_at = NOW(), locked_until = NULL, updated_at = NOW()
+                WHERE receipt_id = %s AND stage IN ('IMAGE_FETCH', 'OCR')
+                """,
+                (event.receipt_id,),
+            )
+            if finalize:
+                _insert_callback(cursor, event, result)
+        connection.commit()
+    return result
+
+
+def save_gst_result(
+    settings: Settings,
+    event: ReceiptEvent,
+    status: str,
+    sensitive_audit: dict[str, object],
+    credit_payload: dict[str, Any] | None,
+) -> EnrichmentResult:
+    with tenant_connection(settings.database_url, event.organization_id, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE enrichment_receipts
+                SET status = %s, gst_status = %s, version = version + 1,
+                    processing_completed_at = NOW(), updated_at = NOW()
+                WHERE receipt_id = %s
+                RETURNING receipt_id, status, ocr_confidence, raw_ocr_json, gst_status, version
+                """,
+                (status, status, event.receipt_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError("ocr_result_missing")
+            result = EnrichmentResult.model_validate(row)
+            ciphertext = encrypt_json(settings, event.site_id, event.receipt_id, "gst_audit", sensitive_audit)
+            cursor.execute(
+                """
+                INSERT INTO immutable_enrichment_audits
+                  (id, organization_id, receipt_id, event_type, event_json, sensitive_event_ciphertext)
+                VALUES (%s, %s, %s, 'GST_VALIDATED', %s, %s)
+                ON CONFLICT (receipt_id, event_type) DO NOTHING
+                """,
+                (uuid4(), event.organization_id, event.receipt_id, Jsonb({"gst_status": status, "sensitive_fields": "kms_encrypted"}), ciphertext),
+            )
+            _insert_callback(cursor, event, result)
+            if credit_payload is not None and settings.credit_provider != "disabled":
                 cursor.execute(
                     """
-                    INSERT INTO immutable_enrichment_audits (id, receipt_id, event_type, event_json, sensitive_event_ciphertext)
-                    VALUES (%s, %s, 'GST_VALIDATED', %s, %s)
+                    INSERT INTO transactional_outbox
+                      (id, organization_id, aggregate_id, event_type, event_version, destination, idempotency_key, payload_json)
+                    VALUES (%s, %s, %s, 'CREDIT_DELIVERY', %s, 'CREDIT_QUEUE', %s, %s)
+                    ON CONFLICT (aggregate_id, event_type, event_version) DO NOTHING
                     """,
-                    (uuid4(), event.receipt_id, Jsonb({"gst_status": gst_status, "sensitive_fields": "kms_encrypted"}), ciphertext),
+                    (uuid4(), event.organization_id, event.receipt_id, result.version, f"credit:{event.receipt_id}:{result.version}", Jsonb(credit_payload)),
                 )
             cursor.execute(
                 """
-                INSERT INTO transactional_outbox (id, aggregate_id, event_type, event_version, payload_json)
-                VALUES (%s, %s, 'ENRICHMENT_CALLBACK', %s, %s)
-                ON CONFLICT (aggregate_id, event_type, event_version) DO NOTHING
-                """,
-                (uuid4(), event.receipt_id, version, Jsonb(result.model_dump(mode="json"))),
-            )
-            cursor.execute(
-                """
-                UPDATE workflow_stages SET status = 'COMPLETED', completed_at = NOW(), updated_at = NOW()
-                WHERE receipt_id = %s AND stage = 'ENRICHMENT'
+                UPDATE workflow_stages
+                SET status = 'COMPLETED', completed_at = NOW(), locked_until = NULL, updated_at = NOW()
+                WHERE receipt_id = %s AND stage = 'GST'
                 """,
                 (event.receipt_id,),
             )
         connection.commit()
-    return version
+    return result
+
+
+def finalize_provider_failure(settings: Settings, event: ReceiptEvent, stage: str, error_code: str) -> EnrichmentResult:
+    with tenant_connection(settings.database_url, event.organization_id, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO enrichment_receipts (
+                  receipt_id, organization_id, site_id, vendor_id, captured_at_unix, site_captured_quantity,
+                  image_sha256, image_bytes, status, raw_ocr_json, provider_version, gst_status,
+                  processing_started_at, processing_completed_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'NEEDS_HUMAN_REVIEW', %s, 'provider-failure', 'NOT_CHECKED', NOW(), NOW())
+                ON CONFLICT (receipt_id) DO UPDATE SET
+                  status = 'NEEDS_HUMAN_REVIEW', version = enrichment_receipts.version + 1,
+                  processing_completed_at = NOW(), updated_at = NOW()
+                RETURNING receipt_id, status, ocr_confidence, raw_ocr_json, gst_status, version
+                """,
+                (
+                    event.receipt_id, event.organization_id, event.site_id, event.vendor_id,
+                    event.captured_at_unix, event.site_captured_quantity, event.image_sha256,
+                    event.image_bytes, Jsonb({"provider_error": error_code[:120]}),
+                ),
+            )
+            result = EnrichmentResult.model_validate(cursor.fetchone())
+            cursor.execute(
+                """
+                INSERT INTO immutable_enrichment_audits (id, organization_id, receipt_id, event_type, event_json)
+                VALUES (%s, %s, %s, 'PROVIDER_FAILED_TERMINAL', %s)
+                ON CONFLICT (receipt_id, event_type) DO NOTHING
+                """,
+                (uuid4(), event.organization_id, event.receipt_id, Jsonb({"stage": stage, "error_code": error_code[:120]})),
+            )
+            _insert_callback(cursor, event, result)
+        connection.commit()
+    return result
+
+
+def existing_enrichment_result(database_url: str, organization_id: str, receipt_id: str) -> EnrichmentResult | None:
+    with tenant_connection(database_url, organization_id, row_factory=dict_row) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT receipt_id, status, ocr_confidence, raw_ocr_json, gst_status, version
+                FROM enrichment_receipts WHERE receipt_id = %s
+                """,
+                (receipt_id,),
+            )
+            row = cursor.fetchone()
+    return None if row is None else EnrichmentResult.model_validate(row)
 
 
 def load_gst_context(settings: Settings, event: ReceiptEvent, kms_client=None) -> GstReceiptContext:
-    with psycopg.connect(settings.database_url, row_factory=dict_row) as connection:
+    with tenant_connection(settings.database_url, event.organization_id, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -189,45 +324,3 @@ def load_gst_context(settings: Settings, event: ReceiptEvent, kms_client=None) -
         msme_udyam_number=decrypt_field("msme_udyam_number_encrypted"),
         recipient_bank_account=decrypt_field("recipient_bank_account_encrypted"),
     )
-
-
-def pending_callback(database_url: str, receipt_id: str) -> tuple[UUID, EnrichmentResult] | None:
-    with psycopg.connect(database_url, row_factory=dict_row) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT id, payload_json FROM transactional_outbox
-                WHERE aggregate_id = %s AND event_type = 'ENRICHMENT_CALLBACK'
-                  AND status IN ('PENDING', 'FAILED_RETRYABLE') AND available_at <= NOW()
-                ORDER BY event_version DESC LIMIT 1
-                """,
-                (receipt_id,),
-            )
-            row = cursor.fetchone()
-    if not row:
-        return None
-    return UUID(str(row["id"])), EnrichmentResult.model_validate(row["payload_json"])
-
-
-def mark_callback_delivered(database_url: str, outbox_id: UUID) -> None:
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE transactional_outbox SET status = 'DELIVERED', attempts = attempts + 1, delivered_at = NOW() WHERE id = %s",
-                (outbox_id,),
-            )
-        connection.commit()
-
-
-def mark_callback_failed(database_url: str, outbox_id: UUID) -> None:
-    with psycopg.connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE transactional_outbox SET status = 'FAILED_RETRYABLE', attempts = attempts + 1,
-                  available_at = NOW() + (LEAST(3600, POWER(2, LEAST(attempts, 10))) * INTERVAL '1 second')
-                WHERE id = %s
-                """,
-                (outbox_id,),
-            )
-        connection.commit()

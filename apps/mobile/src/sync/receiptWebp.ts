@@ -29,7 +29,7 @@ async function readFileAsBytes(filePath: string): Promise<Uint8Array> {
 export async function compressReceiptBlobToWebp(
   blob: Uint8Array,
   quality = 80,
-  maxBytes = 750_000,
+  maxBytes = 5_000_000,
 ): Promise<CompressedReceiptImage> {
   if (Platform.OS !== 'android') {
     throw new Error('WebP compression is only available on Android.');

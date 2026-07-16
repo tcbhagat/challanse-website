@@ -1,5 +1,5 @@
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import type { DeviceIdentity, Env, ReviewerIdentity } from './types';
+import type { AccessIdentity, Env } from './types';
 
 const encoder = new TextEncoder();
 
@@ -12,8 +12,8 @@ export function corsHeaders(request: Request, env: Env): HeadersInit {
   if (!allowedOrigins(env).has(origin)) return {};
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-ChallanSe-Nonce, X-ChallanSe-Timestamp',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Part-Sha256, X-ChallanSe-Nonce, X-ChallanSe-Device-Timestamp, X-ChallanSe-Site-Id, X-ChallanSe-Play-Integrity',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Max-Age': '600',
     Vary: 'Origin',
   };
@@ -25,72 +25,29 @@ export async function sha256Hex(value: string | ArrayBuffer): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-export function randomToken(byteLength = 32): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
-  return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
-}
-
 export function randomEnrollmentCode(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = crypto.getRandomValues(new Uint8Array(8));
   return Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('');
 }
 
-function bearerToken(request: Request): string {
-  const authorization = request.headers.get('Authorization') ?? '';
-  return authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-}
-
-export async function authenticateDevice(request: Request, env: Env): Promise<DeviceIdentity | null> {
-  const token = bearerToken(request);
-  if (!token) return null;
-  const tokenHash = await sha256Hex(`${token}:${env.DEVICE_TOKEN_PEPPER}`);
-  const row = await env.DB.prepare(
-    `SELECT id, site_id, name FROM devices WHERE token_hash = ? AND active = 1 LIMIT 1`,
-  ).bind(tokenHash).first<{ id: string; site_id: string; name: string }>();
-  if (!row) return null;
-  await env.DB.prepare(`UPDATE devices SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(row.id).run();
-  return { id: row.id, siteId: row.site_id, name: row.name };
-}
-
-export async function consumeReplayNonce(request: Request, env: Env, deviceId: string): Promise<boolean> {
-  const nonce = request.headers.get('X-ChallanSe-Nonce') ?? '';
-  const timestamp = Number(request.headers.get('X-ChallanSe-Timestamp') ?? 0);
-  const now = Math.floor(Date.now() / 1000);
-  if (!/^[A-Za-z0-9_-]{16,128}$/.test(nonce) || !Number.isInteger(timestamp) || Math.abs(now - timestamp) > 300) {
-    return false;
-  }
-  const nonceHash = await sha256Hex(`${deviceId}:${nonce}`);
-  const result = await env.DB.prepare(
-    `INSERT OR IGNORE INTO request_nonces (nonce_hash, device_id, expires_at) VALUES (?, ?, datetime('now', '+10 minutes'))`,
-  ).bind(nonceHash, deviceId).run();
-  return Number(result.meta.changes ?? 0) === 1;
-}
-
-export async function authenticateReviewer(
+export async function authenticateAccessIdentity(
   request: Request,
   env: Env,
   verifyToken: typeof jwtVerify = jwtVerify,
-): Promise<ReviewerIdentity | null> {
+): Promise<AccessIdentity | null> {
   const token = request.headers.get('Cf-Access-Jwt-Assertion') ?? '';
   const domain = env.ACCESS_TEAM_DOMAIN.trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!token || !domain || !env.ACCESS_AUD) return null;
   try {
-    const issuer = `https://${domain}`;
-    const jwks = createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
-    const verified = await verifyToken(token, jwks, { issuer, audience: env.ACCESS_AUD });
+    const expectedIssuer = `https://${domain}`;
+    const jwks = createRemoteJWKSet(new URL(`${expectedIssuer}/cdn-cgi/access/certs`));
+    const verified = await verifyToken(token, jwks, { issuer: expectedIssuer, audience: env.ACCESS_AUD });
+    const issuer = String(verified.payload.iss ?? '');
+    const subject = String(verified.payload.sub ?? '');
     const email = String(verified.payload.email ?? '').trim().toLowerCase();
-    if (!email) return null;
-    const row = await env.DB.prepare(
-      `SELECT email, site_id, role FROM reviewers WHERE email = ? AND active = 1 LIMIT 1`,
-    ).bind(email).first<{ email: string; site_id: string; role: 'ADMIN' | 'CONTROLLER' }>();
-    return row ? { email: row.email, siteId: row.site_id, role: row.role } : null;
+    return issuer && subject && email ? { issuer, subject, email } : null;
   } catch {
     return null;
   }
-}
-
-export function isWebp(bytes: Uint8Array): boolean {
-  if (bytes.byteLength < 12) return false;
-  return String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP';
 }

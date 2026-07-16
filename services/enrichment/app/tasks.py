@@ -8,6 +8,7 @@ import boto3
 
 from .config import get_settings
 from .observability import configure_observability
+from .outbox import dispatch_outbox_once
 from .schemas import ReceiptEvent
 from .workflow import process_receipt_event
 
@@ -43,6 +44,7 @@ def run_worker() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     while not stopping.is_set():
+        dispatch_outbox_once(settings)
         response = sqs.receive_message(
             QueueUrl=settings.receipt_queue_url,
             MaxNumberOfMessages=1,
@@ -63,6 +65,7 @@ def run_worker() -> None:
                 event = ReceiptEvent.model_validate(json.loads(message["Body"]))
                 process_receipt_event(settings, event)
                 sqs.delete_message(QueueUrl=settings.receipt_queue_url, ReceiptHandle=receipt_handle)
+                dispatch_outbox_once(settings)
             except Exception as error:
                 logger.error("receipt_processing_failed", extra={"error_code": type(error).__name__})
             finally:

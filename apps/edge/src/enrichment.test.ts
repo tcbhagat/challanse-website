@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { callEnrichment, internalReceiptImage } from './enrichment';
+import { callEnrichment, proxyAuthoritativeRequest } from './enrichment';
 import type { Env } from './types';
 
 async function sha256(body: string): Promise<string> {
@@ -15,37 +15,10 @@ async function signature(secret: string, canonical: string): Promise<string> {
 }
 
 function fakeEnv(): Env {
-  const nonces = new Set<string>();
-  const database = {
-    prepare(sql: string) {
-      return {
-        bind(...values: unknown[]) {
-          return {
-            async run() {
-              if (sql.includes('service_request_nonces')) {
-                const requestId = String(values[0]);
-                if (nonces.has(requestId)) throw new Error('duplicate');
-                nonces.add(requestId);
-              }
-              return { meta: { changes: 1 } };
-            },
-            async first() {
-              if (sql.includes('FROM receipts')) return { image_key: 'site/receipt.webp', image_sha256: 'a'.repeat(64), image_bytes: 12 };
-              return null;
-            },
-          };
-        },
-      };
-    },
-  };
   return {
-    DB: database as unknown as D1Database,
-    RECEIPTS: { get: vi.fn().mockResolvedValue({ body: new Uint8Array([1, 2, 3]) }) } as unknown as R2Bucket,
-    RECEIPT_QUEUE: {} as Queue,
     ALLOWED_ORIGINS: 'https://review.challanse.constrovet.com',
-    ACCESS_TEAM_DOMAIN: '',
-    ACCESS_AUD: '',
-    DEVICE_TOKEN_PEPPER: 'pepper',
+    ACCESS_TEAM_DOMAIN: 'constrovet.cloudflareaccess.com',
+    ACCESS_AUD: 'review-audience',
     TURNSTILE_SECRET: 'turnstile',
     ENVIRONMENT: 'production',
     ENRICHMENT_URL: 'https://enrichment.example',
@@ -53,10 +26,6 @@ function fakeEnv(): Env {
     EDGE_TO_ENRICHMENT_HMAC_KEY: 'edge-secret',
     EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID: 'edge-next',
     EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY: 'edge-next-secret',
-    ENRICHMENT_TO_EDGE_HMAC_KEY_ID: 'enrichment-current',
-    ENRICHMENT_TO_EDGE_HMAC_KEY: 'enrichment-secret',
-    ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID: 'enrichment-next',
-    ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY: 'enrichment-next-secret',
     ENRICHMENT_ACCESS_CLIENT_ID: 'access-id',
     ENRICHMENT_ACCESS_CLIENT_SECRET: 'access-secret',
   };
@@ -64,7 +33,7 @@ function fakeEnv(): Env {
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe('directional enrichment authentication', () => {
+describe('stateless authoritative proxy', () => {
   it('forwards Access credentials and a verifiable content signature', async () => {
     const env = fakeEnv();
     const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 202 }));
@@ -89,41 +58,49 @@ describe('directional enrichment authentication', () => {
     expect(headers.get('X-ChallanSe-Signature')).toBe(await signature('edge-secret', canonical));
   });
 
-  it('streams a private image once and rejects a replayed request ID', async () => {
+  it('forwards immutable OIDC identity and site selection', async () => {
     const env = fakeEnv();
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const requestId = crypto.randomUUID();
-    const path = '/v1/internal/receipts/receipt-1/image';
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const request = new Request('https://api.challanse.constrovet.com/v1/reviewer/receipts?status=NEEDS_REVIEW&limit=25', {
+      headers: { 'X-ChallanSe-Site-Id': '22222222-2222-4222-8222-222222222222' },
+    });
+    await proxyAuthoritativeRequest(request, env, {
+      issuer: 'https://constrovet.cloudflareaccess.com',
+      subject: 'oidc-subject-1',
+      email: 'reviewer@example.com',
+    });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = new Headers(init.headers);
     const contentHash = await sha256('');
-    const signed = await signature('enrichment-secret', [timestamp, requestId, 'enrichment-current', 'GET', path, contentHash].join('\n'));
-    const headers = {
-      'X-ChallanSe-Timestamp': timestamp,
-      'X-ChallanSe-Request-Id': requestId,
-      'X-ChallanSe-Key-Id': 'enrichment-current',
-      'X-ChallanSe-Content-SHA256': contentHash,
-      'X-ChallanSe-Signature': signed,
-    };
-    const first = await internalReceiptImage(new Request(`https://api.example${path}`, { headers }), env, 'receipt-1');
-    const replay = await internalReceiptImage(new Request(`https://api.example${path}`, { headers }), env, 'receipt-1');
-    expect(first.status).toBe(200);
-    expect(first.headers.get('Cache-Control')).toBe('private, no-store');
-    expect(replay.status).toBe(401);
+    const canonical = [
+      headers.get('X-ChallanSe-Timestamp'),
+      headers.get('X-ChallanSe-Request-Id'),
+      'edge-current',
+      'GET',
+      '/v1/reviewer/receipts?status=NEEDS_REVIEW&limit=25',
+      contentHash,
+    ].join('\n');
+    expect(url).toBe('https://enrichment.example/v1/reviewer/receipts?status=NEEDS_REVIEW&limit=25');
+    expect(headers.get('X-ChallanSe-Signature')).toBe(await signature('edge-secret', canonical));
+    expect(headers.get('X-ChallanSe-OIDC-Subject')).toBe('oidc-subject-1');
+    expect(headers.get('X-ChallanSe-Site-Id')).toBe('22222222-2222-4222-8222-222222222222');
   });
 
-  it('accepts the staged next callback key during rotation', async () => {
+  it('streams private image responses without buffering or public caching', async () => {
     const env = fakeEnv();
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    const requestId = crypto.randomUUID();
-    const path = '/v1/internal/receipts/receipt-1/image';
-    const contentHash = await sha256('');
-    const signed = await signature('enrichment-next-secret', [timestamp, requestId, 'enrichment-next', 'GET', path, contentHash].join('\n'));
-    const response = await internalReceiptImage(new Request(`https://api.example${path}`, { headers: {
-      'X-ChallanSe-Timestamp': timestamp,
-      'X-ChallanSe-Request-Id': requestId,
-      'X-ChallanSe-Key-Id': 'enrichment-next',
-      'X-ChallanSe-Content-SHA256': contentHash,
-      'X-ChallanSe-Signature': signed,
-    } }), env, 'receipt-1');
+    const stream = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([1, 2, 3])); controller.close(); } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(stream, {
+      status: 200,
+      headers: { 'Content-Type': 'image/webp', 'Cache-Control': 'private, no-store' },
+    })));
+    const response = await proxyAuthoritativeRequest(
+      new Request('https://api.challanse.constrovet.com/v1/reviewer/receipts/receipt-1/image'),
+      env,
+      { issuer: 'https://constrovet.cloudflareaccess.com', subject: 'subject', email: 'reviewer@example.com' },
+    );
     expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array([1, 2, 3]));
   });
 });

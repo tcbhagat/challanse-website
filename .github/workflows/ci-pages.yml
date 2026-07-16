@@ -71,7 +71,7 @@ jobs:
       - run: python -m pip install --requirement requirements-dev.txt
       - run: python -m pytest -q
       - name: Validate PostgreSQL migrations
-        run: test -s migrations/0001_enrichment.sql && test -s migrations/0002_release_hardening.sql && test -s migrations/0003_operational_jobs.sql && test -s migrations/0004_replay_protection.sql && grep -q 'transactional_outbox' migrations/0002_release_hardening.sql
+        run: test -s migrations/0001_enrichment.sql && test -s migrations/0002_release_hardening.sql && test -s migrations/0003_operational_jobs.sql && test -s migrations/0004_replay_protection.sql && test -s migrations/0005_production_tenancy.sql && grep -q 'transactional_outbox' migrations/0005_production_tenancy.sql
 
   security:
     runs-on: ubuntu-latest
@@ -135,6 +135,7 @@ jobs:
       - run: PYTHONPATH=services/enrichment python -m pytest -q services/enrichment/tests -m integration
         env:
           TEST_DATABASE_URL: postgresql://challanse:challanse-test-only@127.0.0.1:5432/challanse_test
+          TENANT_CONTEXT_HMAC_KEY: 7f4b6d8e905ca22ddf3234f6c5551d9a2a712df06f28da7f13a4a92cadf1108c
           AWS_ENDPOINT_URL: http://127.0.0.1:4566
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
@@ -151,7 +152,7 @@ jobs:
       name: production
     outputs:
       image_uri: ${{ steps.image.outputs.uri }}
-      migration: 0004_replay_protection.sql
+      migration: 0005_production_tenancy.sql
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
@@ -187,7 +188,10 @@ jobs:
           terraform -chdir=infra/terraform/production apply -auto-approve
           -var="container_image=${{ steps.image.outputs.uri }}"
           -var="adot_collector_image=${{ vars.AWS_ADOT_COLLECTOR_IMAGE }}"
-          -var="certificate_arn=${{ vars.AWS_ENRICHMENT_CERTIFICATE_ARN }}"
+          -var="cloudflared_image=${{ vars.AWS_CLOUDFLARED_IMAGE }}"
+          -var="expected_aws_account_id=${{ vars.AWS_PRODUCTION_ACCOUNT_ID }}"
+          -var="backup_destination_vault_arn=${{ vars.AWS_BACKUP_DESTINATION_VAULT_ARN }}"
+          -var="play_integrity_cloud_project_number=${{ vars.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER }}"
           -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
           -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
           -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
@@ -195,10 +199,10 @@ jobs:
       - name: Apply PostgreSQL migrations as one-off task
         run: |
           cluster="$(terraform -chdir=infra/terraform/production output -raw ecs_cluster_name)"
-          task_definition="$(terraform -chdir=infra/terraform/production output -raw api_task_definition_arn)"
+          task_definition="$(terraform -chdir=infra/terraform/production output -raw migration_task_definition_arn)"
           subnets="$(terraform -chdir=infra/terraform/production output -json private_subnet_ids | jq -r 'join(",")')"
           security_group="$(terraform -chdir=infra/terraform/production output -raw service_security_group_id)"
-          task_arn="$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --overrides '{"containerOverrides":[{"name":"api","command":["python","-m","app.migrate"]}]}' --query 'tasks[0].taskArn' --output text)"
+          task_arn="$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" --launch-type FARGATE --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=DISABLED}" --query 'tasks[0].taskArn' --output text)"
           test "$task_arn" != "None"
           aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn"
           exit_code="$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" --query 'tasks[0].containers[0].exitCode' --output text)"
@@ -208,14 +212,19 @@ jobs:
           terraform -chdir=infra/terraform/production apply -auto-approve
           -var="container_image=${{ steps.image.outputs.uri }}"
           -var="adot_collector_image=${{ vars.AWS_ADOT_COLLECTOR_IMAGE }}"
-          -var="certificate_arn=${{ vars.AWS_ENRICHMENT_CERTIFICATE_ARN }}"
+          -var="cloudflared_image=${{ vars.AWS_CLOUDFLARED_IMAGE }}"
+          -var="expected_aws_account_id=${{ vars.AWS_PRODUCTION_ACCOUNT_ID }}"
+          -var="backup_destination_vault_arn=${{ vars.AWS_BACKUP_DESTINATION_VAULT_ARN }}"
+          -var="play_integrity_cloud_project_number=${{ vars.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER }}"
           -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
           -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
           -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
           -var="services_enabled=true"
       - name: Record enrichment deployment evidence
         run: |
-          jq -n --arg commit "$GITHUB_SHA" --arg image "${{ steps.image.outputs.uri }}" --arg region "ap-south-1" --arg migration "0004_replay_protection.sql" '{commit_sha:$commit,image:$image,region:$region,migration:$migration,providers:{ocr:"disabled",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > enrichment-deployment.json
+          bucket="$(terraform -chdir=infra/terraform/production output -raw receipt_bucket_name)"
+          backup_vault="$(terraform -chdir=infra/terraform/production output -raw backup_vault_arn)"
+          jq -n --arg commit "$GITHUB_SHA" --arg image "${{ steps.image.outputs.uri }}" --arg region "ap-south-1" --arg migration "0005_production_tenancy.sql" --arg bucket "$bucket" --arg backup_vault "$backup_vault" '{commit_sha:$commit,image:$image,region:$region,migration:$migration,receipt_bucket:$bucket,backup_vault:$backup_vault,origin_exposure:"cloudflare-tunnel-private-alb",providers:{ocr:"textract",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > enrichment-deployment.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: challanse-enrichment-deployment
@@ -270,38 +279,24 @@ jobs:
       - run: npm ci
       - run: node scripts/render-edge-config.mjs
         env:
-          CLOUDFLARE_D1_DATABASE_ID: ${{ vars.CLOUDFLARE_D1_DATABASE_ID }}
           CLOUDFLARE_ACCESS_TEAM_DOMAIN: ${{ vars.CLOUDFLARE_ACCESS_TEAM_DOMAIN }}
           CLOUDFLARE_ACCESS_AUD: ${{ vars.CLOUDFLARE_ACCESS_AUD }}
           ENRICHMENT_URL: ${{ vars.ENRICHMENT_URL }}
           EDGE_TO_ENRICHMENT_HMAC_KEY_ID: ${{ vars.EDGE_TO_ENRICHMENT_HMAC_KEY_ID }}
           EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID: ${{ vars.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID }}
-          ENRICHMENT_TO_EDGE_HMAC_KEY_ID: ${{ vars.ENRICHMENT_TO_EDGE_HMAC_KEY_ID }}
-          ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID: ${{ vars.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID }}
-      - name: Apply D1 migrations
-        run: npx wrangler d1 migrations apply challanse-pilot --remote --config apps/edge/wrangler.generated.toml
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       - name: Configure Worker secrets
         run: |
-          printf '%s' "$DEVICE_TOKEN_PEPPER" | npx wrangler secret put DEVICE_TOKEN_PEPPER --config apps/edge/wrangler.generated.toml
           printf '%s' "$TURNSTILE_SECRET" | npx wrangler secret put TURNSTILE_SECRET --config apps/edge/wrangler.generated.toml
           printf '%s' "$EDGE_TO_ENRICHMENT_HMAC_KEY" | npx wrangler secret put EDGE_TO_ENRICHMENT_HMAC_KEY --config apps/edge/wrangler.generated.toml
           printf '%s' "$EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY" | npx wrangler secret put EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY --config apps/edge/wrangler.generated.toml
-          printf '%s' "$ENRICHMENT_TO_EDGE_HMAC_KEY" | npx wrangler secret put ENRICHMENT_TO_EDGE_HMAC_KEY --config apps/edge/wrangler.generated.toml
-          printf '%s' "$ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY" | npx wrangler secret put ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY --config apps/edge/wrangler.generated.toml
           printf '%s' "$ENRICHMENT_ACCESS_CLIENT_ID" | npx wrangler secret put ENRICHMENT_ACCESS_CLIENT_ID --config apps/edge/wrangler.generated.toml
           printf '%s' "$ENRICHMENT_ACCESS_CLIENT_SECRET" | npx wrangler secret put ENRICHMENT_ACCESS_CLIENT_SECRET --config apps/edge/wrangler.generated.toml
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          DEVICE_TOKEN_PEPPER: ${{ secrets.DEVICE_TOKEN_PEPPER }}
           TURNSTILE_SECRET: ${{ secrets.TURNSTILE_SECRET }}
           EDGE_TO_ENRICHMENT_HMAC_KEY: ${{ secrets.EDGE_TO_ENRICHMENT_HMAC_KEY }}
           EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY: ${{ secrets.EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY }}
-          ENRICHMENT_TO_EDGE_HMAC_KEY: ${{ secrets.ENRICHMENT_TO_EDGE_HMAC_KEY }}
-          ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY: ${{ secrets.ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY }}
           ENRICHMENT_ACCESS_CLIENT_ID: ${{ secrets.ENRICHMENT_ACCESS_CLIENT_ID }}
           ENRICHMENT_ACCESS_CLIENT_SECRET: ${{ secrets.ENRICHMENT_ACCESS_CLIENT_SECRET }}
       - name: Deploy API
@@ -331,9 +326,13 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   release-android:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.PILOT_DEPLOY_ENABLED == 'true' && vars.PLAY_PUBLISH_ENABLED == 'true'
     needs: [validate, android, enrichment, security, integration, terraform-plan, deploy-enrichment, deploy-cloudflare, deploy-landing]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     environment:
       name: production
     steps:
@@ -367,20 +366,41 @@ jobs:
           CHALLANSE_KEYSTORE_PASSWORD: ${{ secrets.CHALLANSE_KEYSTORE_PASSWORD }}
           CHALLANSE_KEY_ALIAS: ${{ secrets.CHALLANSE_KEY_ALIAS }}
           CHALLANSE_KEY_PASSWORD: ${{ secrets.CHALLANSE_KEY_PASSWORD }}
+          CHALLANSE_VERSION_CODE: ${{ github.run_number }}
+          CHALLANSE_VERSION_NAME: 1.0.${{ github.run_number }}
+          PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER: ${{ vars.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER }}
+      - name: Remove restored upload keystore
+        if: always()
+        run: rm -f apps/mobile/android/challanse-release.jks
       - name: Verify signing identity and create release manifest
         run: |
-          fingerprint="$(keytool -printcert -jarfile apps/mobile/android/app/build/outputs/apk/release/app-release.apk | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -1 | tr -d ':' | tr '[:lower:]' '[:upper:]')"
-          test "$fingerprint" = "$EXPECTED_FINGERPRINT"
+          bundle="apps/mobile/android/app/build/outputs/bundle/release/app-release.aab"
+          fingerprint="$(keytool -printcert -jarfile "$bundle" | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -1 | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+          test "$fingerprint" = "$EXPECTED_UPLOAD_FINGERPRINT"
+          test -n "$PLAY_APP_SIGNING_FINGERPRINT"
           test -z "$REVOKED_FINGERPRINT" || test "$fingerprint" != "$REVOKED_FINGERPRINT"
-          apk_sha256="$(sha256sum apps/mobile/android/app/build/outputs/apk/release/app-release.apk | awk '{print $1}')"
-          jq -n --arg commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg apk_sha256 "$apk_sha256" \
-            --arg signing_cert_sha256 "$fingerprint" --arg revoked_signing_cert_sha256 "$REVOKED_FINGERPRINT" \
+          [[ "$PLAY_RELEASE_TRACK" =~ ^(internal|alpha|production)$ ]]
+          [[ "$PLAY_MANAGED_ORGANIZATIONS_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          test "$PLAY_MANAGED_ORGANIZATIONS_COUNT" -ge 1
+          aab_sha256="$(sha256sum "$bundle" | awk '{print $1}')"
+          npm sbom --sbom-format cyclonedx > mobile-sbom.cdx.json
+          sbom_sha256="$(sha256sum mobile-sbom.cdx.json | awk '{print $1}')"
+          jq -n --arg commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg aab_sha256 "$aab_sha256" \
+            --arg upload_cert_sha256 "$fingerprint" --arg play_app_signing_cert_sha256 "$PLAY_APP_SIGNING_FINGERPRINT" \
+            --arg revoked_signing_cert_sha256 "$REVOKED_FINGERPRINT" --arg sbom_sha256 "$sbom_sha256" \
+            --arg play_track "$PLAY_RELEASE_TRACK" --arg managed_organizations_sha256 "$PLAY_MANAGED_ORGANIZATIONS_SHA256" \
+            --arg managed_organizations_count "$PLAY_MANAGED_ORGANIZATIONS_COUNT" \
             --arg enrichment_image "$ENRICHMENT_IMAGE" --arg migration "$MIGRATION" \
             --arg api_worker_version "$API_WORKER_VERSION" --arg reviewer_worker_version "$REVIEWER_WORKER_VERSION" \
             --arg staging_acceptance_sha256 "$STAGING_ACCEPTANCE_SHA256" --arg android_field_acceptance_sha256 "$ANDROID_FIELD_ACCEPTANCE_SHA256" \
-            '{schema_version:"1.2",commit_sha:$commit,workflow_run_id:$run_id,apk_sha256:$apk_sha256,signing_certificate_sha256:$signing_cert_sha256,revoked_signing_certificate_sha256:$revoked_signing_cert_sha256,enrichment:{image:$enrichment_image,migration:$migration,region:"ap-south-1"},cloudflare:{api_worker_version:$api_worker_version,reviewer_worker_version:$reviewer_worker_version},acceptance:{staging_sha256:$staging_acceptance_sha256,android_field_sha256:$android_field_acceptance_sha256},verification:{https:true,health:true,readiness:true,access_gate:true},external_providers:{ocr:"disabled",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > release-manifest.json
+            --arg client_acceptance_sha256 "$CLIENT_ACCEPTANCE_SHA256" --arg operator_training_sha256 "$OPERATOR_TRAINING_SHA256" \
+            --arg security_acceptance_sha256 "$SECURITY_ACCEPTANCE_SHA256" --arg capacity_acceptance_sha256 "$CAPACITY_ACCEPTANCE_SHA256" \
+            --arg recovery_acceptance_sha256 "$RECOVERY_ACCEPTANCE_SHA256" \
+            --arg version_code "$GITHUB_RUN_NUMBER" --arg version_name "1.0.$GITHUB_RUN_NUMBER" \
+            '{schema_version:"2.3",distribution:"managed-google-play-private",play_track:$play_track,managed_organizations:{count:($managed_organizations_count|tonumber),sha256:$managed_organizations_sha256},version_code:($version_code|tonumber),version_name:$version_name,commit_sha:$commit,workflow_run_id:$run_id,aab_sha256:$aab_sha256,upload_certificate_sha256:$upload_cert_sha256,play_app_signing_certificate_sha256:$play_app_signing_cert_sha256,revoked_signing_certificate_sha256:$revoked_signing_cert_sha256,sbom_sha256:$sbom_sha256,enrichment:{image:$enrichment_image,migration:$migration,region:"ap-south-1"},cloudflare:{api_worker_version:$api_worker_version,reviewer_worker_version:$reviewer_worker_version},acceptance:{staging_sha256:$staging_acceptance_sha256,android_field_sha256:$android_field_acceptance_sha256,client_sha256:$client_acceptance_sha256,operator_training_sha256:$operator_training_sha256,security_sha256:$security_acceptance_sha256,capacity_sha256:$capacity_acceptance_sha256,recovery_sha256:$recovery_acceptance_sha256},verification:{https:true,health:true,readiness:true,access_gate:true},external_providers:{ocr:"textract",gst:"disabled",notifications:"disabled",credit:"disabled",slack:"disabled"}}' > release-manifest.json
         env:
-          EXPECTED_FINGERPRINT: ${{ vars.CHALLANSE_SIGNING_CERT_SHA256 }}
+          EXPECTED_UPLOAD_FINGERPRINT: ${{ vars.CHALLANSE_UPLOAD_CERT_SHA256 }}
+          PLAY_APP_SIGNING_FINGERPRINT: ${{ vars.CHALLANSE_PLAY_APP_SIGNING_CERT_SHA256 }}
           REVOKED_FINGERPRINT: ${{ vars.CHALLANSE_REVOKED_SIGNING_CERT_SHA256 }}
           ENRICHMENT_IMAGE: ${{ needs.deploy-enrichment.outputs.image_uri }}
           MIGRATION: ${{ needs.deploy-enrichment.outputs.migration }}
@@ -388,13 +408,37 @@ jobs:
           REVIEWER_WORKER_VERSION: ${{ needs.deploy-cloudflare.outputs.reviewer_worker_version }}
           STAGING_ACCEPTANCE_SHA256: ${{ vars.STAGING_ACCEPTANCE_SHA256 }}
           ANDROID_FIELD_ACCEPTANCE_SHA256: ${{ vars.ANDROID_FIELD_ACCEPTANCE_SHA256 }}
+          CLIENT_ACCEPTANCE_SHA256: ${{ vars.CLIENT_ACCEPTANCE_SHA256 }}
+          OPERATOR_TRAINING_SHA256: ${{ vars.OPERATOR_TRAINING_SHA256 }}
+          SECURITY_ACCEPTANCE_SHA256: ${{ vars.SECURITY_ACCEPTANCE_SHA256 }}
+          CAPACITY_ACCEPTANCE_SHA256: ${{ vars.CAPACITY_ACCEPTANCE_SHA256 }}
+          RECOVERY_ACCEPTANCE_SHA256: ${{ vars.RECOVERY_ACCEPTANCE_SHA256 }}
+          PLAY_RELEASE_TRACK: ${{ vars.PLAY_RELEASE_TRACK }}
+          PLAY_MANAGED_ORGANIZATIONS_SHA256: ${{ vars.PLAY_MANAGED_ORGANIZATIONS_SHA256 }}
+          PLAY_MANAGED_ORGANIZATIONS_COUNT: ${{ vars.PLAY_MANAGED_ORGANIZATIONS_COUNT }}
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: apps/mobile/android/app/build/outputs/bundle/release/app-release.aab
+      - name: Publish Managed Google Play private track
+        uses: r0adkll/upload-google-play@935ef9c68bb393a8e6116b1575626a7f5be3a7fb # v1.1.3
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.constrovet.challanse
+          releaseFiles: apps/mobile/android/app/build/outputs/bundle/release/app-release.aab
+          track: ${{ vars.PLAY_RELEASE_TRACK }}
+          status: completed
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: challanse-android-release
-          path: apps/mobile/android/app/build/outputs/apk/release/app-release.apk
+          name: challanse-android-app-bundle
+          path: apps/mobile/android/app/build/outputs/bundle/release/app-release.aab
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: challanse-release-manifest
           path: release-manifest.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: challanse-mobile-sbom
+          path: mobile-sbom.cdx.json
           if-no-files-found: error

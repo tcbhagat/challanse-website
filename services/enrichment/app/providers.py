@@ -27,11 +27,11 @@ class GstResult:
 
 
 class CreditQueue(Protocol):
-    def enqueue(self, payload: dict[str, Any]) -> str: ...
+    def enqueue(self, payload: dict[str, Any], idempotency_key: str) -> str: ...
 
 
 class DisabledCreditQueue:
-    def enqueue(self, payload: dict[str, Any]) -> str:
+    def enqueue(self, payload: dict[str, Any], idempotency_key: str) -> str:
         raise RuntimeError("credit_provider_disabled")
 
 
@@ -39,7 +39,7 @@ class MemoryCreditQueue:
     def __init__(self) -> None:
         self.payloads: list[dict[str, Any]] = []
 
-    def enqueue(self, payload: dict[str, Any]) -> str:
+    def enqueue(self, payload: dict[str, Any], idempotency_key: str) -> str:
         self.payloads.append(payload)
         return f"mock-{len(self.payloads)}"
 
@@ -51,11 +51,14 @@ class SqsCreditQueue:
         self.queue_url = settings.credit_queue_url
         self.client = client or boto3.client("sqs", region_name=settings.aws_region)
 
-    def enqueue(self, payload: dict[str, Any]) -> str:
-        response = self.client.send_message(
-            QueueUrl=self.queue_url,
-            MessageBody=json.dumps(payload, separators=(",", ":")),
-        )
+    def enqueue(self, payload: dict[str, Any], idempotency_key: str) -> str:
+        request = {
+            "QueueUrl": self.queue_url,
+            "MessageBody": json.dumps(payload, separators=(",", ":")),
+        }
+        if self.queue_url.endswith(".fifo"):
+            request.update(MessageGroupId="verified-gst", MessageDeduplicationId=idempotency_key)
+        response = self.client.send_message(**request)
         message_id = response.get("MessageId")
         if not message_id:
             raise RuntimeError("credit_message_id_missing")

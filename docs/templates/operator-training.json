@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "trained_operators": 0,
+  "incident_runbook_exercise_passed": false,
+  "restore_observation_completed": false,
+  "independent_production_approval_enabled": false,
+  "completed_at": "",
+  "evidence_owner": ""
+}

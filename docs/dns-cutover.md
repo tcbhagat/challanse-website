@@ -43,7 +43,7 @@ If zone creation returns `403`, the safest beginner route is:
 4. Stop at the DNS review screen; do not change Namecheap nameservers.
 5. Rerun `./scripts/go-live.sh dns-onboard` so the CLI validates and completes the three preserved records.
 
-Alternatively, recreate the API token with **Account → Zone → Edit**, **Zone → DNS → Edit**, and **Zone → Dynamic URL Redirects → Edit** permissions scoped to the Constrovet account and domain. Never grant global account access when a narrower scope is available.
+Alternatively, recreate the API token with **Account → Zone → Edit**, **Account → Account Rulesets → Read** (or **Account WAF → Read** where that label is shown), **Zone → DNS → Edit**, **Zone → Dynamic URL Redirects → Edit**, and **Zone → WAF → Edit** permissions scoped to the Constrovet account and domain. Never grant global account access when a narrower scope is available.
 
 ## Change Namecheap nameservers
 

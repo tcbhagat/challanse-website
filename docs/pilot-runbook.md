@@ -1,50 +1,58 @@
-# Controlled pilot runbook
+# Client rollout and operations runbook
 
-## Approved scope
+## Approved first-release scope
 
-- One construction site, no more than five enrolled Android devices and two reviewers.
-- Approximately 50 receipts per day; synchronized images target 750 KB.
-- Directly signed APK distribution; manual controller verification is authoritative.
-- No formal SLA. Pilot recovery target is one business day with no more than 24 hours of data loss.
+- Up to three clients, 100 enrolled Android devices, about 20 sites, and 1,000 receipts daily.
+- Managed Google Play private AAB distribution only.
+- Textract-assisted OCR, manual verification, Tally reconciliation, and audit exports are active.
+- GST, credit, WhatsApp, Slack, automated statutory claims, and individual notifications are disabled.
+- Business-hours support: Monday–Friday, 09:00–18:00 India Standard Time, excluding published holidays. Do not advertise 24×7 support.
 
-## Release gates
+## Release sequence
 
-1. Rotate the exposed Android signing identity with `rotate-signing`; verify the active and revoked fingerprints differ and preserve the encrypted offline backup separately.
-2. Provision separate staging and production AWS accounts using `docs/aws-bootstrap.md`.
-3. Run all required CI checks: `validate`, `android`, `enrichment`, `security`, `integration`, and `terraform-plan`.
-4. Deploy staging with providers disabled and process at least 20 synthetic receipts with no loss or duplication.
-5. Record the reviewed staging report using `accept-staging`.
-6. On Android 8/API 26 with no more than 2 GB RAM, run 100 real binary writes from 500 KB to 5 MB; require p95 below 50 ms, encryption proof, restart/reboot recovery, and no metadata loss.
-7. Record the field report using `accept-android-field`.
-8. Run `harden-github`; keep `PILOT_DEPLOY_ENABLED=false` until the guarded deployment begins.
-9. Deploy only after typing `DEPLOY <commit-sha>` and verify the release manifest against the APK.
-
-Templates are in `docs/templates/`. Acceptance hashes prove which reviewed files were approved; keep the original reports in the controlled release evidence store.
+1. Rotate the exposed upload identity and prove the revoked fingerprint cannot pass CI.
+2. Enable Google Play App Signing and configure the private application and client organization availability.
+3. Provision separate staging and production AWS accounts using `docs/aws-bootstrap.md`.
+4. Configure enterprise OIDC with MFA and verify PostgreSQL membership remains the final authorization decision.
+5. Run `validate`, `android`, `enrichment`, `security`, `integration`, and `terraform-plan`.
+6. Process at least 20 synthetic staging receipts with no loss, duplication, or cross-tenant access.
+7. Record staging, Android, security, capacity, and recovery acceptance using the templates in `docs/templates/`; keep the referenced evidence files outside the repository.
+8. Record first-client acceptance, configure the `internal` Play track, and run `harden-github`.
+9. Verify every acceptance report and evidence artifact SHA-256 before typing the exact `DEPLOY <commit-sha>` confirmation.
+10. Verify the release manifest against the AAB, Play certificates, SBOM, infrastructure evidence, and acceptance hashes.
+11. Promote to `alpha` and then `production` only after explicit client acceptance evidence.
 
 ## Field acceptance
 
-1. Seed only owner-approved site, Wi-Fi, reviewer, and vendor data.
-2. Enroll two devices using separate single-use 10-minute QR codes. Prove expiry, reuse rejection, device cap, and revocation.
+1. Bootstrap only owner-approved organizations, sites, Wi-Fi policies, OIDC administrators, and vendors.
+2. Enroll two devices with separate single-use 10-minute codes; prove expiry, reuse denial, revocation, and tenant/site scope.
 3. Capture 20 receipts offline, restart one app, reboot one device, reconnect while charging on approved Wi-Fi, and confirm exactly-once cloud records.
-4. Verify image checksum, private streaming, cross-site denial, replay denial, and concurrent reviewer `409` behavior.
-5. Import a synthetic then approved Tally CSV; verify duplicate detection, unit handling, and red `Site Received > PO Quantity` rows.
-6. Confirm provider status visibly remains disabled for OCR, GST, WhatsApp, Slack, and credit unless separate approval evidence exists.
+4. Verify checksum, private S3 image streaming, replay denial, cross-tenant denial, and concurrent reviewer `409` behavior.
+5. Import an approved Tally CSV and verify validation, checksum deduplication, unit normalization, unmatched rows, and red over-quantity rows.
+6. Confirm the UI states OCR as active and GST, credit, WhatsApp, and Slack as disabled.
 
-## Operations
+## Daily operations
 
-- Devices never delete unsynced data. Acknowledged local images have a seven-day grace period.
-- At 70% of the pilot allowance, warn administrators; at 90%, pause uploads while preserving local queues.
-- R2 images are deleted after 90 days and remaining receipt/audit data after one year through tombstone workflows.
-- Generate four-hour digest records without individual notifications. Delivery remains disabled until approved.
-- Generate nightly friction reports for write latency above 100 ms, site sync failure above 20%, and vendor OCR confidence below 70%.
+- Devices retain unsynced receipts indefinitely. Acknowledged local images are deleted only after seven days.
+- Approved SSID is a data-cost control and is never treated as physical-presence proof.
+- Review queue age, DLQ, API errors, database capacity, upload failures, certificate expiry, and budget alarms each business day.
+- Generate organization-scoped audit exports through authenticated reviewer routes; never export one tenant's data from another tenant context.
 - Never log images, OCR text, credentials, GST/IRN/Udyam/bank values, or personal contacts.
+
+## Backup and recovery
+
+- Verify automated backups daily and perform a quarterly isolated PostgreSQL/S3 restoration exercise.
+- Accept production only after a production-like restore demonstrates RPO no greater than one hour and RTO no greater than eight hours.
+- Live images are deleted after 90 days and receipt/audit rows after one year. Encrypted recovery copies follow the documented 35-day backup schedule and are a disclosed retention exception.
+- Record restore start/end, selected recovery point, object and row counts, application checks, operator identity, and evidence hashes.
 
 ## Incident response
 
-1. Run `./scripts/rollback-production.sh` to disable deployment while preserving D1, R2, PostgreSQL, SQS, and device queues.
-2. Add `--revoke-devices` only for credential compromise; this requires re-enrollment.
-3. Replay DLQ messages only after the root cause is fixed and the exact queue ARN is confirmed.
-4. Restore RDS to an isolated instance before any destructive production recovery.
-5. Record incident timeline, affected receipt UUIDs, recovery evidence, and residual risk without copying receipt contents into logs.
+1. Disable new releases with `./scripts/rollback-production.sh`; device queues and authoritative AWS data remain intact.
+2. Add `--revoke-devices` only for device-credential compromise; re-enrollment is then mandatory.
+3. Contain access through Cloudflare Access membership revocation, device revocation, HMAC key overlap rotation, or AWS service scaling as appropriate.
+4. Replay DLQ events only after fixing the root cause and confirming the exact environment and queue.
+5. Restore to isolated infrastructure before destructive recovery or comparison.
+6. Record timeline, affected receipt UUIDs, tenant scope, recovery evidence, notification decision, and residual risk without copying receipt contents into logs.
 
-Losing the direct-distribution signing key prevents seamless APK updates. Maintain one verified encrypted offline backup and store its password separately.
+Before client two, train a second operator and require independent deployment approval. Availability and recovery objectives are operational targets, not an SLA, until incorporated into a signed client agreement.

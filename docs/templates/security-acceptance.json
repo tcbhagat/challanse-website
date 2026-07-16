@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "tenants_tested": 0,
+  "cross_tenant_endpoint_tests_passed": false,
+  "postgres_rls_direct_access_denied": false,
+  "forged_oidc_rejected": false,
+  "replayed_device_nonces_rejected": false,
+  "owasp_masvs_review_completed": false,
+  "owasp_api_review_completed": false,
+  "unresolved_critical_findings": null,
+  "unresolved_high_findings": null,
+  "completed_at": "",
+  "evidence_owner": "",
+  "evidence_artifacts": [
+    {
+      "name": "",
+      "sha256": ""
+    }
+  ]
+}

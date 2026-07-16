@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "client_organization_id_hash": "",
+  "managed_play_access_confirmed": false,
+  "controlled_rollout_accepted": false,
+  "accepted_by": "",
+  "accepted_at": "",
+  "evidence_artifacts": [
+    {
+      "name": "",
+      "sha256": ""
+    }
+  ]
+}

@@ -12,5 +12,13 @@
   "raw_database_scan_clean": false,
   "restart_recovery_passed": false,
   "reboot_sync_passed": false,
-  "interrupted_upload_resume_passed": false
+  "interrupted_upload_resume_passed": false,
+  "completed_at": "",
+  "evidence_owner": "",
+  "evidence_artifacts": [
+    {
+      "name": "",
+      "sha256": ""
+    }
+  ]
 }

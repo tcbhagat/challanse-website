@@ -38,9 +38,51 @@ variable "adot_collector_image" {
   }
 }
 
-variable "certificate_arn" {
+variable "cloudflared_image" {
   type        = string
-  description = "Validated ACM certificate for the Cloudflare-proxied enrichment origin hostname."
+  description = "Immutable Cloudflare Tunnel connector image URI including sha256 digest."
+  validation {
+    condition     = strcontains(var.cloudflared_image, "@sha256:")
+    error_message = "cloudflared_image must be pinned by sha256 digest"
+  }
+}
+
+variable "expected_aws_account_id" {
+  type        = string
+  description = "The environment account ID. Prevents applying production state in the wrong AWS account."
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.expected_aws_account_id))
+    error_message = "expected_aws_account_id must contain 12 digits"
+  }
+}
+
+variable "backup_destination_vault_arn" {
+  type        = string
+  description = "Cross-account AWS Backup vault ARN. Required for production and optional for staging."
+  default     = ""
+  validation {
+    condition     = var.backup_destination_vault_arn == "" || can(regex("^arn:aws:backup:[a-z0-9-]+:[0-9]{12}:backup-vault:", var.backup_destination_vault_arn))
+    error_message = "backup_destination_vault_arn must be an AWS Backup vault ARN"
+  }
+}
+
+variable "ocr_provider" {
+  type        = string
+  description = "Production must use textract; staging may use deterministic mock OCR."
+  validation {
+    condition     = contains(["mock", "textract"], var.ocr_provider) && (var.environment != "production" || var.ocr_provider == "textract")
+    error_message = "ocr_provider must be textract in production and mock or textract in staging"
+  }
+}
+
+variable "play_integrity_cloud_project_number" {
+  type        = number
+  description = "Google Cloud project number linked to the private Play app. Required in production."
+  default     = 0
+  validation {
+    condition     = var.environment != "production" || var.play_integrity_cloud_project_number > 0
+    error_message = "Production requires a linked Play Integrity Cloud project number"
+  }
 }
 
 variable "monthly_budget_usd" {
@@ -68,6 +110,15 @@ variable "github_oidc_provider_arn" {
 
 variable "multi_az" {
   type = bool
+}
+
+variable "database_instance_class" {
+  type        = string
+  description = "Environment-sized RDS instance class. Production must not use a micro class."
+  validation {
+    condition     = can(regex("^db\\.[a-z0-9.]+$", var.database_instance_class)) && (var.environment != "production" || !endswith(var.database_instance_class, ".micro"))
+    error_message = "database_instance_class must be a valid RDS class; production cannot use a micro class"
+  }
 }
 
 variable "api_desired_count" {
