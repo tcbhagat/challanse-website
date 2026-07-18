@@ -24,6 +24,9 @@ locals {
   tags = {
     Project     = var.project
     Environment = var.environment
+    Owner       = "constrovet"
+    CostCenter  = "challanse-pilot"
+    ClientScope = "shared-pilot"
     ManagedBy   = "terraform"
     DataClass   = "confidential-receipt-metadata"
   }
@@ -1354,16 +1357,30 @@ resource "aws_budgets_budget" "monthly" {
   time_unit    = "MONTHLY"
   notification {
     comparison_operator        = "GREATER_THAN"
+    threshold                  = 50
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = [var.budget_email, var.secondary_budget_email]
+  }
+  notification {
+    comparison_operator        = "GREATER_THAN"
     threshold                  = 70
     threshold_type             = "PERCENTAGE"
     notification_type          = "FORECASTED"
-    subscriber_email_addresses = [var.budget_email]
+    subscriber_email_addresses = [var.budget_email, var.secondary_budget_email]
   }
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 90
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
-    subscriber_email_addresses = [var.budget_email]
+    subscriber_email_addresses = [var.budget_email, var.secondary_budget_email]
+  }
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "ACTUAL"
+    subscriber_email_addresses = [var.budget_email, var.secondary_budget_email]
   }
 }

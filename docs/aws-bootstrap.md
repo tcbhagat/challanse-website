@@ -30,8 +30,9 @@ terraform -chdir=infra/terraform/staging plan \
   -var="certificate_arn=<staging-acm-arn>" \
   -var="backup_destination_vault_arn=<backup-vault-arn>" \
   -var="play_integrity_cloud_project_number=<project-number>" \
-  -var="monthly_budget_usd=<approved-number>" \
-  -var="budget_email=<operator-email>" \
+  -var="monthly_budget_usd=225" \
+  -var="budget_email=<primary-operator-email>" \
+  -var="secondary_budget_email=<secondary-operator-email>" \
   -var="github_oidc_provider_arn=<staging-oidc-provider-arn>" \
   -var="services_enabled=false"
 ```
@@ -41,6 +42,8 @@ Review and apply the saved plan. The ALB listener must use TLS 1.2 or newer and 
 ## Production bootstrap
 
 Repeat with `infra/terraform/production` in the production account. Production uses two NAT gateways, two API tasks, two baseline workers plus queue-depth autoscaling, Multi-AZ PostgreSQL, deletion protection, continuous recovery, and cross-account backup copies.
+
+Use `monthly_budget_usd=350` for production and maintain the separate USD 50 recovery-account allowance documented in `pilot-budget.md`. Do not raise these values without written budget reapproval. Both operator addresses must confirm AWS Budget subscriptions at 50%, 70%, 90%, and 100%.
 
 The generated GitHub deploy role is service-family scoped inside the dedicated environment account and cannot modify itself. Initial role creation or policy changes require the privileged bootstrap operator. After the protected workflow assumes the generated role successfully, remove the temporary bootstrap role.
 

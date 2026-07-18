@@ -117,13 +117,30 @@ variable "monthly_budget_usd" {
   type        = number
   description = "Mandatory operator-approved monthly AWS budget."
   validation {
-    condition     = var.monthly_budget_usd > 0
-    error_message = "monthly_budget_usd must be greater than zero"
+    condition = var.monthly_budget_usd > 0 && (
+      (var.environment == "production" && var.monthly_budget_usd <= 350) ||
+      (var.environment != "production" && var.monthly_budget_usd <= 225)
+    )
+    error_message = "monthly_budget_usd exceeds the approved pilot ceiling (production USD 350; non-production USD 225)"
   }
 }
 
 variable "budget_email" {
-  type = string
+  type        = string
+  description = "Primary operator address for AWS budget notifications."
+  validation {
+    condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.budget_email))
+    error_message = "budget_email must be a valid operator email address"
+  }
+}
+
+variable "secondary_budget_email" {
+  type        = string
+  description = "Independent secondary operator address for AWS budget notifications."
+  validation {
+    condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.secondary_budget_email)) && lower(var.secondary_budget_email) != lower(var.budget_email)
+    error_message = "secondary_budget_email must be a valid address different from budget_email"
+  }
 }
 
 variable "github_repository" {

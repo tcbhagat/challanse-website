@@ -194,8 +194,9 @@ jobs:
           -var="expected_aws_account_id=${{ vars.AWS_PRODUCTION_ACCOUNT_ID }}"
           -var="backup_destination_vault_arn=${{ vars.AWS_BACKUP_DESTINATION_VAULT_ARN }}"
           -var="play_integrity_cloud_project_number=${{ vars.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER }}"
-          -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
+          -var="monthly_budget_usd=${{ vars.AWS_PRODUCTION_MONTHLY_BUDGET_USD }}"
           -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
+          -var="secondary_budget_email=${{ vars.AWS_SECONDARY_BUDGET_EMAIL }}"
           -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
           -var="services_enabled=false"
       - name: Apply PostgreSQL migrations as one-off task
@@ -220,8 +221,9 @@ jobs:
           -var="expected_aws_account_id=${{ vars.AWS_PRODUCTION_ACCOUNT_ID }}"
           -var="backup_destination_vault_arn=${{ vars.AWS_BACKUP_DESTINATION_VAULT_ARN }}"
           -var="play_integrity_cloud_project_number=${{ vars.PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER }}"
-          -var="monthly_budget_usd=${{ vars.AWS_MONTHLY_BUDGET_USD }}"
+          -var="monthly_budget_usd=${{ vars.AWS_PRODUCTION_MONTHLY_BUDGET_USD }}"
           -var="budget_email=${{ vars.AWS_BUDGET_EMAIL }}"
+          -var="secondary_budget_email=${{ vars.AWS_SECONDARY_BUDGET_EMAIL }}"
           -var="github_oidc_provider_arn=${{ vars.AWS_GITHUB_OIDC_PROVIDER_ARN }}"
           -var="services_enabled=true"
       - name: Record enrichment deployment evidence

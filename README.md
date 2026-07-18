@@ -99,6 +99,8 @@ Production OCR uses Textract. GST, credit, WhatsApp, Slack, and individual alert
 
 Business-hours support is documented in `docs/pilot-runbook.md`; no 24×7 support is offered. Follow `docs/aws-bootstrap.md`, `docs/hybrid-enrichment.md`, `docs/release-readiness.md`, and `docs/pilot-runbook.md` before onboarding a client.
 
+The three-month pilot is governed by `docs/pilot-budget.md`: INR 450,000 total cash ceiling, INR 60,000 combined monthly cloud ceiling, separate staging/production budgets, two-operator alerts, and stop/reapproval gates. Passing technical checks does not authorize expenditure beyond those controls.
+
 Emergency stop preserves server data and every device's local queue:
 
 ```bash

@@ -10,6 +10,8 @@
 
 ## Release sequence
 
+0. Confirm the current approval envelope and spending gates in `pilot-budget.md`; no persistent AWS provisioning is permitted without the required budget and two-operator alerts.
+
 1. Rotate the exposed upload identity and prove the revoked fingerprint cannot pass CI.
 2. Enable Google Play App Signing and configure the private application and client organization availability.
 3. Provision separate staging and production AWS accounts using `docs/aws-bootstrap.md`.

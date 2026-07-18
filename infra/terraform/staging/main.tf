@@ -22,6 +22,7 @@ module "enrichment" {
   ocr_provider                 = "mock"
   monthly_budget_usd           = var.monthly_budget_usd
   budget_email                 = var.budget_email
+  secondary_budget_email       = var.secondary_budget_email
   github_oidc_provider_arn     = var.github_oidc_provider_arn
   multi_az                     = false
   database_instance_class      = "db.t4g.micro"
@@ -44,6 +45,7 @@ variable "backup_destination_vault_arn" {
 }
 variable "monthly_budget_usd" { type = number }
 variable "budget_email" { type = string }
+variable "secondary_budget_email" { type = string }
 variable "github_oidc_provider_arn" { type = string }
 variable "services_enabled" {
   type    = bool

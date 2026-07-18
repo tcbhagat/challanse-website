@@ -9,6 +9,9 @@ STATE_FILE="$STATE_DIR/production.env"
 DNS_BASELINE="$STATE_DIR/dns-baseline.json"
 DNS_ONBOARDING_BASELINE="$STATE_DIR/dns-onboarding.json"
 CF_API="https://api.cloudflare.com/client/v4"
+EXPECTED_DEBUG_KEYSTORE_PATH="apps/mobile/android/app/debug.keystore"
+EXPECTED_DEBUG_KEYSTORE_SHA256="221e0a3106aa4c3ccc154e0a418b55020b3f9ea6e84f92e8749cd9e2f39f5e58"
+EXPECTED_DEBUG_CERT_SHA256="FAC61745DC0903786FB9EDE62A962B399F7348F0BB6F899B8332667591033B9C"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -400,6 +403,52 @@ validate_new_keystore_path() {
   resolved_parent="$(cd "$parent" && pwd -P)"
   [[ "$resolved_parent" != "$ROOT" && "$resolved_parent" != "$ROOT"/* ]] || die "Release keystore must be stored outside the Git repository."
   [[ "$(basename "$keystore")" =~ ^[A-Za-z0-9._-]+\.jks$ ]] || die "Keystore filename contains unsafe characters. Use letters, numbers, dots, dashes, or underscores."
+}
+
+debug_keystore_is_expected() {
+  local keystore="$1" file_digest certificate_digest
+  [[ -r "$keystore" ]] || return 1
+  file_digest="$(sha256sum "$keystore" | awk '{print $1}')"
+  [[ "$file_digest" == "$EXPECTED_DEBUG_KEYSTORE_SHA256" ]] || return 1
+  certificate_digest="$(
+    keytool -list -v -keystore "$keystore" -alias androiddebugkey -storepass android -keypass android 2>/dev/null |
+      sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' |
+      head -1 |
+      tr -d ':' |
+      tr '[:lower:]' '[:upper:]'
+  )"
+  [[ "$certificate_digest" == "$EXPECTED_DEBUG_CERT_SHA256" ]]
+}
+
+release_keystore_paths_in_history() {
+  local repository="$1" object path temporary
+  while read -r object path; do
+    [[ "$path" =~ \.(jks|keystore)$ ]] || continue
+    if [[ "$path" != "$EXPECTED_DEBUG_KEYSTORE_PATH" ]]; then
+      printf '%s@%s\n' "$path" "$object"
+      continue
+    fi
+    if [[ "$(git -C "$repository" cat-file -t "$object" 2>/dev/null || true)" != "blob" ]]; then
+      printf '%s@%s\n' "$path" "$object"
+      continue
+    fi
+    temporary="$(mktemp "$STATE_DIR/debug-keystore-history.XXXXXX")"
+    git -C "$repository" cat-file blob "$object" > "$temporary"
+    if ! debug_keystore_is_expected "$temporary"; then
+      printf '%s@%s\n' "$path" "$object"
+    fi
+    shred -u -- "$temporary"
+  done < <(git -C "$repository" rev-list --objects --all)
+}
+
+release_keystore_paths_in_worktree() {
+  local scan_root="$1" keystore relative
+  while IFS= read -r -d '' keystore; do
+    relative="${keystore#"$scan_root"/}"
+    if [[ "$relative" != "$EXPECTED_DEBUG_KEYSTORE_PATH" ]] || ! debug_keystore_is_expected "$keystore"; then
+      printf '%s\n' "$keystore"
+    fi
+  done < <(find "$scan_root" -type f \( -name '*.jks' -o -name '*.keystore' \) -print0)
 }
 
 rotate_turnstile_secret() {
@@ -868,13 +917,26 @@ rotate_enrichment_keys() {
   printf 'Directional enrichment keys %sd. Production remains disabled; deploy the overlap set before the next phase.\n' "$mode"
 }
 
+validate_aws_budget_inputs() {
+  [[ "$AWS_PRODUCTION_MONTHLY_BUDGET_USD" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Production monthly budget must be numeric."
+  [[ "$AWS_STAGING_MONTHLY_BUDGET_USD" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Staging monthly budget must be numeric."
+  awk -v value="$AWS_PRODUCTION_MONTHLY_BUDGET_USD" 'BEGIN { exit !(value > 0 && value <= 350) }' || die "Production budget exceeds the approved USD 350 ceiling."
+  awk -v value="$AWS_STAGING_MONTHLY_BUDGET_USD" 'BEGIN { exit !(value > 0 && value <= 225) }' || die "Staging budget exceeds the approved USD 225 ceiling."
+  [[ "$AWS_BUDGET_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "Primary AWS budget email is invalid."
+  [[ "$AWS_SECONDARY_BUDGET_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "Secondary AWS budget email is invalid."
+  [[ "${AWS_BUDGET_EMAIL,,}" != "${AWS_SECONDARY_BUDGET_EMAIL,,}" ]] || die "AWS budget notifications require two different operator emails."
+}
+
 configure_aws() {
   preflight
   local variables name label value
-  variables='AWS_PRODUCTION_ACCOUNT_ID AWS_PRODUCTION_TERRAFORM_ROLE_ARN AWS_ECR_REPOSITORY AWS_ADOT_COLLECTOR_IMAGE AWS_CLOUDFLARED_IMAGE AWS_PRIVATE_ALB_CERTIFICATE_ARN AWS_TERRAFORM_STATE_BUCKET AWS_TERRAFORM_STATE_KMS_KEY_ARN AWS_BACKUP_DESTINATION_VAULT_ARN AWS_MONTHLY_BUDGET_USD AWS_BUDGET_EMAIL AWS_GITHUB_OIDC_PROVIDER_ARN'
+  variables='AWS_PRODUCTION_ACCOUNT_ID AWS_PRODUCTION_TERRAFORM_ROLE_ARN AWS_ECR_REPOSITORY AWS_ADOT_COLLECTOR_IMAGE AWS_CLOUDFLARED_IMAGE AWS_PRIVATE_ALB_CERTIFICATE_ARN AWS_TERRAFORM_STATE_BUCKET AWS_TERRAFORM_STATE_KMS_KEY_ARN AWS_BACKUP_DESTINATION_VAULT_ARN AWS_PRODUCTION_MONTHLY_BUDGET_USD AWS_STAGING_MONTHLY_BUDGET_USD AWS_BUDGET_EMAIL AWS_SECONDARY_BUDGET_EMAIL AWS_GITHUB_OIDC_PROVIDER_ARN'
   for name in $variables; do
     label="${name//_/ }"
     prompt_value "$name" "$label"
+  done
+  validate_aws_budget_inputs
+  for name in $variables; do
     value="${!name}"
     gh variable set "$name" --repo "$REPO" --env production --body "$value"
   done
@@ -921,11 +983,11 @@ rotate_signing() {
   load_state
   local old_keystore="${SIGNING_KEYSTORE_PATH:-}" old_fingerprint="${SIGNING_CERT_SHA256:-}" keystore password password_confirm fingerprint encoded confirmation backup_dir backup_path backup_password backup_password_confirm
   [[ -n "$old_keystore" && -n "$old_fingerprint" ]] || die "Existing signing state is missing. Run configure-github instead."
-  if git rev-list --objects --all | awk '{print $2}' | grep -Eiq '\.(jks|keystore)$'; then
-    die "A keystore path exists in Git history. Remove it from history and rotate any affected credentials before continuing."
+  if [[ -n "$(release_keystore_paths_in_history "$ROOT")" ]]; then
+    die "A release keystore path exists in Git history. Remove it from history and rotate any affected credentials before continuing."
   fi
-  if find "$ROOT" -type f \( -name '*.jks' -o -name '*.keystore' \) -print -quit | grep -q .; then
-    die "A keystore exists inside the repository working tree. Remove it securely before continuing."
+  if [[ -n "$(release_keystore_paths_in_worktree "$ROOT")" ]]; then
+    die "A release keystore exists inside the repository working tree. Remove it securely before continuing."
   fi
   printf 'Exposed signing certificate SHA-256: %s\n' "$old_fingerprint"
   read -r -p 'Type ROTATE EXPOSED SIGNING KEY to continue: ' confirmation
@@ -970,7 +1032,7 @@ deploy() {
   preflight
   local required_secrets required_variables run_id pending ids body deployment_flag commit_sha confirmation github_fingerprint organization_count protection required_approvals
   required_secrets='["CLOUDFLARE_ACCOUNT_ID","CLOUDFLARE_API_TOKEN","DEVICE_TOKEN_PEPPER","TURNSTILE_SECRET","CHALLANSE_KEYSTORE_BASE64","CHALLANSE_KEYSTORE_PASSWORD","CHALLANSE_KEY_ALIAS","CHALLANSE_KEY_PASSWORD","PLAY_SERVICE_ACCOUNT_JSON","PLAY_MANAGED_ORGANIZATION_IDS","EDGE_TO_ENRICHMENT_HMAC_KEY","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY","ENRICHMENT_TO_EDGE_HMAC_KEY","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY","ENRICHMENT_ACCESS_CLIENT_ID","ENRICHMENT_ACCESS_CLIENT_SECRET"]'
-  required_variables='["CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","CLOUDFLARE_FREE_WAF_ENABLED","ACCESS_IDENTITY_PROVIDER_ID","ACCESS_MFA_ENFORCED","TURNSTILE_SITE_KEY","CHALLANSE_UPLOAD_CERT_SHA256","CHALLANSE_PLAY_APP_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256","PLAY_PUBLISH_ENABLED","PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER","PLAY_MANAGED_ORGANIZATIONS_SHA256","PLAY_MANAGED_ORGANIZATIONS_COUNT","PLAY_RELEASE_TRACK","ENRICHMENT_URL","EDGE_TO_ENRICHMENT_HMAC_KEY_ID","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID","AWS_PRODUCTION_ACCOUNT_ID","AWS_PRODUCTION_TERRAFORM_ROLE_ARN","AWS_ECR_REPOSITORY","AWS_ADOT_COLLECTOR_IMAGE","AWS_CLOUDFLARED_IMAGE","AWS_PRIVATE_ALB_CERTIFICATE_ARN","AWS_TERRAFORM_STATE_BUCKET","AWS_TERRAFORM_STATE_KMS_KEY_ARN","AWS_BACKUP_DESTINATION_VAULT_ARN","AWS_MONTHLY_BUDGET_USD","AWS_BUDGET_EMAIL","AWS_GITHUB_OIDC_PROVIDER_ARN","AWS_RUNTIME_SECRET_ARN","AWS_DEAD_LETTER_QUEUE_URL","AWS_ENRICHMENT_BOOTSTRAPPED","CLOUDFLARE_TUNNEL_ID","AWS_PRIVATE_ORIGIN_URL","CLOUDFLARE_TUNNEL_ORIGIN_TLS_VERIFIED","STAGING_ACCEPTANCE_SHA256","ANDROID_FIELD_ACCEPTANCE_SHA256","SECURITY_ACCEPTANCE_SHA256","CAPACITY_ACCEPTANCE_SHA256","RECOVERY_ACCEPTANCE_SHA256"]'
+  required_variables='["CLOUDFLARE_ACCESS_TEAM_DOMAIN","CLOUDFLARE_ACCESS_AUD","CLOUDFLARE_FREE_WAF_ENABLED","ACCESS_IDENTITY_PROVIDER_ID","ACCESS_MFA_ENFORCED","TURNSTILE_SITE_KEY","CHALLANSE_UPLOAD_CERT_SHA256","CHALLANSE_PLAY_APP_SIGNING_CERT_SHA256","CHALLANSE_REVOKED_SIGNING_CERT_SHA256","PLAY_PUBLISH_ENABLED","PLAY_INTEGRITY_CLOUD_PROJECT_NUMBER","PLAY_MANAGED_ORGANIZATIONS_SHA256","PLAY_MANAGED_ORGANIZATIONS_COUNT","PLAY_RELEASE_TRACK","ENRICHMENT_URL","EDGE_TO_ENRICHMENT_HMAC_KEY_ID","EDGE_TO_ENRICHMENT_NEXT_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_HMAC_KEY_ID","ENRICHMENT_TO_EDGE_NEXT_HMAC_KEY_ID","AWS_PRODUCTION_ACCOUNT_ID","AWS_PRODUCTION_TERRAFORM_ROLE_ARN","AWS_ECR_REPOSITORY","AWS_ADOT_COLLECTOR_IMAGE","AWS_CLOUDFLARED_IMAGE","AWS_PRIVATE_ALB_CERTIFICATE_ARN","AWS_TERRAFORM_STATE_BUCKET","AWS_TERRAFORM_STATE_KMS_KEY_ARN","AWS_BACKUP_DESTINATION_VAULT_ARN","AWS_PRODUCTION_MONTHLY_BUDGET_USD","AWS_STAGING_MONTHLY_BUDGET_USD","AWS_BUDGET_EMAIL","AWS_SECONDARY_BUDGET_EMAIL","AWS_GITHUB_OIDC_PROVIDER_ARN","AWS_RUNTIME_SECRET_ARN","AWS_DEAD_LETTER_QUEUE_URL","AWS_ENRICHMENT_BOOTSTRAPPED","CLOUDFLARE_TUNNEL_ID","AWS_PRIVATE_ORIGIN_URL","CLOUDFLARE_TUNNEL_ORIGIN_TLS_VERIFIED","STAGING_ACCEPTANCE_SHA256","ANDROID_FIELD_ACCEPTANCE_SHA256","SECURITY_ACCEPTANCE_SHA256","CAPACITY_ACCEPTANCE_SHA256","RECOVERY_ACCEPTANCE_SHA256"]'
   jq -e --argjson required "$required_secrets" '($required - [.[].name]) | length == 0' >/dev/null < <(gh secret list --repo "$REPO" --env production --json name) || die "Required production secrets are missing."
   jq -e --argjson required "$required_variables" '($required - [.[].name]) | length == 0' >/dev/null < <(gh variable list --repo "$REPO" --env production --json name) || die "Required production variables are missing."
   local revoked_fingerprint
