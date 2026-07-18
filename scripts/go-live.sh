@@ -9,6 +9,9 @@ STATE_FILE="$STATE_DIR/production.env"
 DNS_BASELINE="$STATE_DIR/dns-baseline.json"
 DNS_ONBOARDING_BASELINE="$STATE_DIR/dns-onboarding.json"
 CF_API="https://api.cloudflare.com/client/v4"
+EXPECTED_DEBUG_KEYSTORE_PATH="apps/mobile/android/app/debug.keystore"
+EXPECTED_DEBUG_KEYSTORE_SHA256="221e0a3106aa4c3ccc154e0a418b55020b3f9ea6e84f92e8749cd9e2f39f5e58"
+EXPECTED_DEBUG_CERT_SHA256="FAC61745DC0903786FB9EDE62A962B399F7348F0BB6F899B8332667591033B9C"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -402,17 +405,50 @@ validate_new_keystore_path() {
   [[ "$(basename "$keystore")" =~ ^[A-Za-z0-9._-]+\.jks$ ]] || die "Keystore filename contains unsafe characters. Use letters, numbers, dots, dashes, or underscores."
 }
 
+debug_keystore_is_expected() {
+  local keystore="$1" file_digest certificate_digest
+  [[ -r "$keystore" ]] || return 1
+  file_digest="$(sha256sum "$keystore" | awk '{print $1}')"
+  [[ "$file_digest" == "$EXPECTED_DEBUG_KEYSTORE_SHA256" ]] || return 1
+  certificate_digest="$(
+    keytool -list -v -keystore "$keystore" -alias androiddebugkey -storepass android -keypass android 2>/dev/null |
+      sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' |
+      head -1 |
+      tr -d ':' |
+      tr '[:lower:]' '[:upper:]'
+  )"
+  [[ "$certificate_digest" == "$EXPECTED_DEBUG_CERT_SHA256" ]]
+}
+
 release_keystore_paths_in_history() {
-  git rev-list --objects --all |
-    awk '{print $2}' |
-    grep -Ei '\.(jks|keystore)$' |
-    grep -Ev '^apps/mobile/android/app/debug\.keystore$' || true
+  local repository="$1" object path temporary
+  while read -r object path; do
+    [[ "$path" =~ \.(jks|keystore)$ ]] || continue
+    if [[ "$path" != "$EXPECTED_DEBUG_KEYSTORE_PATH" ]]; then
+      printf '%s@%s\n' "$path" "$object"
+      continue
+    fi
+    if [[ "$(git -C "$repository" cat-file -t "$object" 2>/dev/null || true)" != "blob" ]]; then
+      printf '%s@%s\n' "$path" "$object"
+      continue
+    fi
+    temporary="$(mktemp "$STATE_DIR/debug-keystore-history.XXXXXX")"
+    git -C "$repository" cat-file blob "$object" > "$temporary"
+    if ! debug_keystore_is_expected "$temporary"; then
+      printf '%s@%s\n' "$path" "$object"
+    fi
+    shred -u -- "$temporary"
+  done < <(git -C "$repository" rev-list --objects --all)
 }
 
 release_keystore_paths_in_worktree() {
-  local scan_root="$1"
-  find "$scan_root" -type f \( -name '*.jks' -o -name '*.keystore' \) \
-    ! -path "$scan_root/apps/mobile/android/app/debug.keystore" -print
+  local scan_root="$1" keystore relative
+  while IFS= read -r -d '' keystore; do
+    relative="${keystore#"$scan_root"/}"
+    if [[ "$relative" != "$EXPECTED_DEBUG_KEYSTORE_PATH" ]] || ! debug_keystore_is_expected "$keystore"; then
+      printf '%s\n' "$keystore"
+    fi
+  done < <(find "$scan_root" -type f \( -name '*.jks' -o -name '*.keystore' \) -print0)
 }
 
 rotate_turnstile_secret() {
@@ -947,7 +983,7 @@ rotate_signing() {
   load_state
   local old_keystore="${SIGNING_KEYSTORE_PATH:-}" old_fingerprint="${SIGNING_CERT_SHA256:-}" keystore password password_confirm fingerprint encoded confirmation backup_dir backup_path backup_password backup_password_confirm
   [[ -n "$old_keystore" && -n "$old_fingerprint" ]] || die "Existing signing state is missing. Run configure-github instead."
-  if [[ -n "$(release_keystore_paths_in_history)" ]]; then
+  if [[ -n "$(release_keystore_paths_in_history "$ROOT")" ]]; then
     die "A release keystore path exists in Git history. Remove it from history and rotate any affected credentials before continuing."
   fi
   if [[ -n "$(release_keystore_paths_in_worktree "$ROOT")" ]]; then

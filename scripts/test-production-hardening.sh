@@ -31,14 +31,38 @@ if (validate_new_keystore_path "$safe_dir/password!value.jks") >/dev/null 2>&1; 
 fi
 rm -rf "$safe_dir"
 
-[[ -z "$(release_keystore_paths_in_history)" ]] || fail "the standard Android debug keystore was treated as a release secret"
+[[ -z "$(release_keystore_paths_in_history "$ROOT")" ]] || fail "the standard Android debug keystore was treated as a release secret"
 keystore_fixture="$(mktemp -d)"
 mkdir -p "$keystore_fixture/apps/mobile/android/app"
-touch "$keystore_fixture/apps/mobile/android/app/debug.keystore"
+cp "$ROOT/apps/mobile/android/app/debug.keystore" "$keystore_fixture/apps/mobile/android/app/debug.keystore"
 [[ -z "$(release_keystore_paths_in_worktree "$keystore_fixture")" ]] || fail "the standard Android debug keystore was rejected"
+printf 'not the approved debug key' > "$keystore_fixture/apps/mobile/android/app/debug.keystore"
+[[ -n "$(release_keystore_paths_in_worktree "$keystore_fixture")" ]] || fail "a replaced debug keystore was trusted by path"
+cp "$ROOT/apps/mobile/android/app/debug.keystore" "$keystore_fixture/apps/mobile/android/app/debug.keystore"
 touch "$keystore_fixture/release.jks"
 [[ "$(release_keystore_paths_in_worktree "$keystore_fixture")" == "$keystore_fixture/release.jks" ]] || fail "a release keystore in the repository was not rejected"
 rm -rf "$keystore_fixture"
+
+history_fixture="$(mktemp -d)"
+git -C "$history_fixture" init -q
+git -C "$history_fixture" config user.name 'ChallanSe Test'
+git -C "$history_fixture" config user.email 'test@challanse.invalid'
+mkdir -p "$history_fixture/apps/mobile/android/app"
+cp "$ROOT/apps/mobile/android/app/debug.keystore" "$history_fixture/apps/mobile/android/app/debug.keystore"
+git -C "$history_fixture" add apps/mobile/android/app/debug.keystore
+git -C "$history_fixture" commit -qm 'approved debug key'
+[[ -z "$(release_keystore_paths_in_history "$history_fixture")" ]] || fail "approved debug key history was rejected"
+printf 'historical release key disguised as debug' > "$history_fixture/apps/mobile/android/app/debug.keystore"
+git -C "$history_fixture" add apps/mobile/android/app/debug.keystore
+git -C "$history_fixture" commit -qm 'replaced debug key'
+[[ -n "$(release_keystore_paths_in_history "$history_fixture")" ]] || fail "a replaced historical debug key was trusted by path"
+cp "$ROOT/apps/mobile/android/app/debug.keystore" "$history_fixture/release.keystore"
+git -C "$history_fixture" add release.keystore
+git -C "$history_fixture" commit -qm 'release key in history'
+history_findings="$(release_keystore_paths_in_history "$history_fixture")"
+grep -Fq 'apps/mobile/android/app/debug.keystore@' <<<"$history_findings" || fail "historical debug-key replacement was not reported"
+grep -Fq 'release.keystore@' <<<"$history_findings" || fail "additional release keystore was not reported"
+rm -rf "$history_fixture"
 
 operator_report="$TEST_CONFIG/operator-training.json"
 cat > "$operator_report" <<'JSON'
