@@ -3,12 +3,12 @@
   admin off
 }
 
-https://{$CHALLANSE_LAN_IP}:8443 {
+:8443 {
   tls /etc/challanse-tls/pilot.crt /etc/challanse-tls/pilot.key
   reverse_proxy edge:8787
 }
 
-https://{$CHALLANSE_LAN_IP}:8444 {
+:8444 {
   tls /etc/challanse-tls/pilot.crt /etc/challanse-tls/pilot.key
   handle /login* {
     reverse_proxy api:8080

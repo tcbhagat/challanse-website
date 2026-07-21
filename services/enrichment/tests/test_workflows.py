@@ -42,6 +42,7 @@ from app.integrity import _trusted as trusted_play_integrity_payload
 from app.ingress import MemoryIngressStore, PostgresIngressStore
 from app.jobs import apply_retention, generate_digests, generate_nightly_report, record_telemetry
 from app.local_auth import LocalAuthError, authenticate, enroll_reviewer, validate_session
+from app.local_seed import SYNTHETIC_ORGANIZATION_ID as LOCAL_SYNTHETIC_ORGANIZATION_ID, TALLY_CSV
 from app.pilot_control import PilotControlError, require_capture_enabled
 from app.main import app, get_ingress_store_dependency
 from app.notifications import DigestReceipt, aggregate_digests
@@ -89,6 +90,12 @@ ORGANIZATION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 HMAC_KEY_ID = "edge-current"
 HMAC_SECRET = "test-edge-secret"
 TENANT_CONTEXT_HMAC_KEY = hashlib.sha256(b"challanse-test-tenant-context").hexdigest()
+
+
+def test_local_seed_uses_the_reserved_synthetic_organization() -> None:
+    assert LOCAL_SYNTHETIC_ORGANIZATION_ID == UUID("10000000-0000-4000-8000-000000000001")
+    rows = parse_tally_csv(TALLY_CSV)
+    assert len(rows) == 4
 
 
 class FakeResponse:

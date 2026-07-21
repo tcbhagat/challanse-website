@@ -221,7 +221,7 @@ services:
       - ${CHALLANSE_RUNTIME_ROOT}/tls:/etc/challanse-tls:ro
       - ../../apps/reviewer/dist:/srv/reviewer:ro
     depends_on: [edge]
-    networks: [frontend]
+    networks: [frontend, lan-publish]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -260,4 +260,6 @@ networks:
   ocr-egress:
     internal: true
   tunnel-egress:
+    internal: false
+  lan-publish:
     internal: false

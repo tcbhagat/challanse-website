@@ -144,6 +144,15 @@ grep -Eq '^FROM .+@sha256:[0-9a-f]{64}$' services/enrichment/Dockerfile
 grep -Eq '^FROM .+@sha256:[0-9a-f]{64}$' deploy/local/Dockerfile.caddy
 grep -Fq 'RUN setcap -r /usr/bin/caddy' deploy/local/Dockerfile.caddy
 grep -Fq 'USER 1000:1000' deploy/local/Dockerfile.caddy
+grep -Fq ':8443 {' deploy/local/Caddyfile
+grep -Fq ':8444 {' deploy/local/Caddyfile
+# shellcheck disable=SC2016 # Intentional literal source-code assertion.
+ip_literal_caddy_address='https://{$CHALLANSE_LAN_IP}'
+if grep -Fq "$ip_literal_caddy_address" deploy/local/Caddyfile; then
+  echo "IP-literal TLS must not require SNI because clients omit SNI for IP addresses." >&2
+  exit 1
+fi
+sed -n '/^  gateway:/,/^  cloudflared:/p' deploy/local/docker-compose.yml | grep -Fq 'networks: [frontend, lan-publish]'
 if grep -Eq '^[[:space:]]*tmpfs:[[:space:]]*\[' deploy/local/docker-compose.yml; then
   echo "Compose tmpfs mounts must use quoted block-list entries so commas remain mount options." >&2
   exit 1
@@ -224,8 +233,14 @@ fi
 grep -Fq "RUNTIME_ROOT=\"\${XDG_CACHE_HOME:-\$HOME/.cache}/challanse-local-runtime\"" scripts/local-pilot.sh
 grep -Fxq '.local-runtime' .dockerignore
 grep -Fxq '**/*.key' .dockerignore
+grep -Fq 'WHERE id <> %s AND active LIMIT 1' services/enrichment/app/local_seed.py
 if grep -Fq "RUNTIME_ROOT=\"\$ROOT/" scripts/local-pilot.sh; then
   echo "Generated local runtime material must remain outside the repository." >&2
   exit 1
 fi
 echo "Production configuration checks passed."
+# identity_links has no updated_at column; local seeding must remain schema-compatible.
+identity_link_seed_sql="$(sed -n '/INSERT INTO identity_links/,/"""/p' services/enrichment/app/local_seed.py)"
+if printf '%s\n' "$identity_link_seed_sql" | grep -q 'updated_at'; then
+  fail "local seed must not write identity_links.updated_at"
+fi

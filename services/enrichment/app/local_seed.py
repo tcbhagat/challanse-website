@@ -13,11 +13,11 @@ ORGANIZATION_ID = UUID("10000000-0000-4000-8000-000000000001")
 SITE_ID = UUID("20000000-0000-4000-8000-000000000001")
 PRIMARY_REVIEWER = "admin@constrovet.com"
 SECOND_REVIEWER = "bhagat.taran@gmail.com"
-TALLY_CSV = """po_number,material_code,material_description,unit,po_quantity
-PO-SYN-001,CEMENT-OPC,OPC Cement,BAG,100
-PO-SYN-002,STEEL-TMT,TMT Steel,KG,500
-PO-SYN-003,SAND-M,Synthetic M Sand,TON,20
-PO-SYN-004,BRICK-FLYASH,Fly Ash Brick,NOS,2000
+TALLY_CSV = """po_number,material_code,quantity,unit
+PO-SYN-001,CEMENT-OPC,100,BAG
+PO-SYN-002,STEEL-TMT,500,KG
+PO-SYN-003,SAND-M,20,TON
+PO-SYN-004,BRICK-FLYASH,2000,NOS
 """
 
 
@@ -37,7 +37,7 @@ def _add_reviewer(settings, email: str, role: str) -> None:
             """
             INSERT INTO identity_links (id, user_id, issuer, subject, email)
             VALUES (%s, %s, 'https://local-pilot.challanse', %s, %s)
-            ON CONFLICT (issuer, subject) DO UPDATE SET email = excluded.email, updated_at = NOW()
+            ON CONFLICT (issuer, subject) DO UPDATE SET email = excluded.email
             """,
             (identity_id, user_id, f"local:{email}", email),
         )
@@ -68,7 +68,7 @@ def seed_local_pilot() -> dict[str, str]:
         raise RuntimeError("controlled_client_pilot_seed_forbidden")
     with system_connection(settings.system_database_url, row_factory=dict_row) as connection:
         real_organization = connection.execute(
-            "SELECT 1 FROM organizations WHERE id <> %s LIMIT 1", (SYNTHETIC_ORGANIZATION_ID,)
+            "SELECT 1 FROM organizations WHERE id <> %s AND active LIMIT 1", (SYNTHETIC_ORGANIZATION_ID,)
         ).fetchone()
     if real_organization:
         raise RuntimeError("client_configuration_present_seed_forbidden")
