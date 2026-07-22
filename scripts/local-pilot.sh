@@ -668,6 +668,13 @@ seed() {
   compose exec -T api python -m app.local_seed
   printf 'Synthetic site, four vendors, two reviewers, and Tally data are seeded.\n'
 }
+test_data() {
+  require_encrypted_storage
+  python3 "$ROOT/scripts/generate-local-fixtures.py" "$DATA_ROOT/fixtures"
+  jq -e 'length == 5 and all(.synthetic == true)' "$DATA_ROOT/fixtures/manifest.json" >/dev/null
+  printf 'Synthetic test data refreshed:\n  Images: %s/*.webp\n  Tally CSV: %s/synthetic-tally.csv\n' \
+    "$DATA_ROOT/fixtures" "$DATA_ROOT/fixtures"
+}
 enroll() {
   require_encrypted_storage
   load_env
@@ -725,6 +732,7 @@ acceptance() {
   require_encrypted_storage
   load_env
   local output code report run_status cleanup_status
+  python3 "$ROOT/scripts/generate-local-fixtures.py" "$DATA_ROOT/fixtures"
   output="$(compose exec -T api python -m app.local_acceptance prepare)"
   code="$(sed -n 's/^enrollment_code=\([^ ]*\).*/\1/p' <<<"$output")"
   [[ -n "$code" ]] || die "Acceptance enrollment code could not be generated."
@@ -818,6 +826,7 @@ Commands:
   start --lan        Start LAN-only supervised pilot
   start --both       Start LAN and preconfigured Cloudflare Tunnel
   seed               Seed synthetic site, vendors, reviewers, and Tally data
+  test-data          Refresh five WebP fixtures and the compatible Tally CSV
   enroll             Create a ten-minute device enrollment link
   reviewer-enroll    Create or rotate one reviewer's password and MFA
   backup PATH        Create an encrypted Restic backup on an external USB mount
@@ -849,6 +858,7 @@ case "${1:-}" in
   provision) provision ;;
   start) start_stack "${2:---lan}" ;;
   seed) seed ;;
+  test-data) test_data ;;
   enroll) enroll ;;
   reviewer-enroll) reviewer_enroll ;;
   backup) backup_pilot "${2:-}" ;;

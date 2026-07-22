@@ -50,6 +50,7 @@ Reviewer credentials are not created during provisioning. Each named reviewer re
 ```bash
 ./scripts/local-pilot.sh start --lan
 ./scripts/local-pilot.sh seed
+./scripts/local-pilot.sh test-data
 ./scripts/local-pilot.sh reviewer-enroll
 ./scripts/local-pilot.sh reviewer-enroll
 ./scripts/local-pilot.sh status

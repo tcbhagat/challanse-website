@@ -38,11 +38,11 @@ def main() -> int:
         manifest.append({"file": path.name, "synthetic": True, "expectedText": lines})
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     (output_dir / "synthetic-tally.csv").write_text(
-        "po_number,material_code,material_description,unit,po_quantity\n"
-        "PO-SYN-001,CEMENT-OPC,OPC Cement,BAG,100\n"
-        "PO-SYN-002,STEEL-TMT,TMT Steel,KG,500\n"
-        "PO-SYN-003,SAND-M,Synthetic M Sand,TON,20\n"
-        "PO-SYN-004,BRICK-FLYASH,Fly Ash Brick,NOS,2000\n",
+        "po_number,material_code,quantity,unit\n"
+        "PO-SYN-001,CEMENT-OPC,100,BAG\n"
+        "PO-SYN-002,STEEL-TMT,500,KG\n"
+        "PO-SYN-003,SAND-M,20,TON\n"
+        "PO-SYN-004,BRICK-FLYASH,2000,NOS\n",
         encoding="utf-8",
     )
     return 0

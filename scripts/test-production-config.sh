@@ -257,3 +257,10 @@ grep -Fq 'No successful acceptance report from the last 24 hours exists' scripts
   || fail "evidence generation must require recent successful acceptance"
 grep -Fq 'python -m app.local_acceptance verify-clean' scripts/local-pilot.sh \
   || fail "evidence generation must verify acceptance cleanup"
+grep -Fq '"po_number,material_code,quantity,unit\n"' scripts/generate-local-fixtures.py \
+  || fail "synthetic Tally fixture must match the importer schema"
+if grep -Fq 'material_description,unit,po_quantity' scripts/generate-local-fixtures.py; then
+  fail "synthetic Tally fixture must not use the obsolete schema"
+fi
+grep -Fq 'test-data) test_data ;;' scripts/local-pilot.sh \
+  || fail "local pilot must expose a safe test-data refresh command"
