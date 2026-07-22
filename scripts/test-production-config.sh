@@ -264,3 +264,7 @@ if grep -Fq 'material_description,unit,po_quantity' scripts/generate-local-fixtu
 fi
 grep -Fq 'test-data) test_data ;;' scripts/local-pilot.sh \
   || fail "local pilot must expose a safe test-data refresh command"
+grep -Fq 'ChallanSe Local Synthetic Testing Runbook' docs/local-testing-runbook.md \
+  || fail "beginner-safe local testing runbook is missing"
+grep -Fq 'queueDepthAfterWait' docs/local-testing-runbook.md \
+  || fail "local testing runbook must document acceptance validation"

@@ -2,6 +2,8 @@
 
 This environment defaults to supervised demonstrations with synthetic data. A guarded `controlled-client-pilot` mode exists, but remains unavailable until individual reviewer MFA, a recent encrypted backup, a tested restore, an independent security report, and signed client approval are recorded. AWS deployment remains frozen. Images, OCR text, PostgreSQL data, and exports stay in the encrypted pilot container. Cloudflare Tunnel, when explicitly started, transports encrypted traffic but does not store receipt payloads.
 
+For a command-by-command synthetic test procedure with expected outputs, use [`local-testing-runbook.md`](local-testing-runbook.md).
+
 On Snap-packaged Docker, the CLI automatically applies `deploy/local/docker-compose.snap.yml`. Snap's runtime rejects all container execution when `no-new-privileges` is requested, so the override removes only that incompatible option after verifying Docker still reports AppArmor and built-in seccomp. Read-only roots, dropped capabilities, non-root users, resource limits, pinned images, and isolated networks remain enforced.
 
 ## Safety Boundary

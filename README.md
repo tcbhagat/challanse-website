@@ -2,7 +2,7 @@
 
 Multi-tenant construction receipt capture and reconciliation for Android field devices and finance reviewers. AWS Mumbai is the authoritative application data plane; Cloudflare provides stateless DNS, WAF, Access, Turnstile, and routing.
 
-AWS deployment is currently frozen. The zero-budget, synthetic, local-LLM client demonstration environment is documented in [`docs/local-pilot.md`](docs/local-pilot.md).
+AWS deployment is currently frozen. The zero-budget, synthetic, local-LLM client demonstration environment is documented in [`docs/local-pilot.md`](docs/local-pilot.md). Beginner-safe execution steps and expected results are in [`docs/local-testing-runbook.md`](docs/local-testing-runbook.md).
 
 ## Product scope
 
