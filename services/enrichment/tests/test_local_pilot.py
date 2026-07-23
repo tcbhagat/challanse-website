@@ -1,4 +1,5 @@
 from collections import namedtuple
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -230,3 +231,10 @@ def test_local_test_artifacts_cannot_escape_encrypted_export_root(tmp_path) -> N
     assert _validated_artifact_directory(settings, str(allowed)) == allowed.resolve()
     with pytest.raises(LocalTestRunError, match="local_test_artifact_path_invalid"):
         _validated_artifact_directory(settings, str(tmp_path / "outside"))
+
+
+def test_raw_migrations_do_not_require_runtime_database_roles() -> None:
+    migration_root = Path(__file__).resolve().parents[1] / "migrations"
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in sorted(migration_root.glob("*.sql")))
+    assert "challanse_app" not in combined
+    assert "challanse_system" not in combined

@@ -34,4 +34,4 @@ CREATE TABLE IF NOT EXISTS local_operator_events (
 CREATE INDEX IF NOT EXISTS local_operator_events_created_idx
   ON local_operator_events(created_at DESC);
 
-REVOKE ALL ON TABLE local_test_runs, local_operator_events FROM PUBLIC, challanse_app;
+REVOKE ALL ON TABLE local_test_runs, local_operator_events FROM PUBLIC;
